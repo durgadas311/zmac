@@ -197,7 +197,7 @@ void process_nodes(void)
 			case N_BYTE:
 				free(n);
 				n = pop();
-				(unsigned char*)p = sp->buffer + n->at.offset;
+				p = sp->buffer + n->at.offset;
 #ifdef DEBUG
 				if (debug) printf("byte sp=%p offset=%.4x "
 					"value=%.2x\n",
@@ -208,7 +208,7 @@ void process_nodes(void)
 			case N_WORD:
 				free(n);
 				n = pop();
-				(unsigned char*)p = sp->buffer + n->at.offset;
+				p = sp->buffer + n->at.offset;
 #ifdef DEBUG
 				if (debug) printf("word sp=%p offset=%.4x "
 					"value=%.4x\n",

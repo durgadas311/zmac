@@ -161,7 +161,7 @@ void add_item(struct object_item *item, char *filename)
 			secs[T_COMMON] = p;
 			break;
 		case C_EXTENSION:	/* 4 */
-			b = BNAME;
+			b = (unsigned char *)BNAME;
 			switch (b[0]) {
 			case 'A':	/* operator */
 				add_node(secs[current_section_t],

@@ -251,7 +251,7 @@ void dump_item(struct object_item *item)
 			switch (item->v.special.B_name[0]) {
 			int operator;
 			case 'A':
-				operator = item->v.special.B_name[1];;
+				operator = item->v.special.B_name[1] & 0xff;
 				if (operator > 11) die(E_INPUT,
 					"ld80: Unknow operator %.2x\n",
 					operator);
@@ -264,9 +264,9 @@ void dump_item(struct object_item *item)
 				break;
 			case 'C':
 				printf(" operand %.4x (%s)\n",
-					(item->v.special.B_name[3] << 8) +
-					item->v.special.B_name[2],
-					atypes[item->v.special.B_name[1]]);
+					((item->v.special.B_name[3] & 0xff) << 8) +
+					(item->v.special.B_name[2] & 0xff),
+					atypes[item->v.special.B_name[1] & 0xff]);
 				break;
 			default:
 				die(E_INPUT, "ld80: Unknown extension %.2x\n",

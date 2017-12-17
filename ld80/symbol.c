@@ -1,6 +1,7 @@
 #include <search.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "ld80.h"
 
 static struct symbol *symbol_table;

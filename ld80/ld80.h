@@ -48,7 +48,7 @@ struct object_item {
 			int A_t;
 			unsigned short A_value;
 			int B_len;
-			unsigned char B_name[NAMELEN+1];
+			char B_name[NAMELEN+1];
 		} special;
 	} v;
 };

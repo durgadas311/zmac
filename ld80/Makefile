@@ -1,6 +1,6 @@
 VERSION = 0.4b
 CFLAGS = -g -Wall -Wstrict-prototypes -DVERSION=\"$(VERSION)\"
-#CFLAGS := $(CFLAGS) -DDEBUG
+CFLAGS := $(CFLAGS) -DDEBUG
 
 .SUFFIXES: .pod .1 .html .ps
 
