@@ -8,9 +8,13 @@ DEP=zmac.o mio.o doc.o zi80dis.o
 zmac: doc.inl $(DEP)
 	$(CXX) -Wall $(CXXFLAGS) -o zmac $(DEP)
 
+zmac.c: zmac.y
+	yacc -d zmac.y
+	cat y.tab.h y.tab.c >zmac.c
+
 doc.inl: doc.c doc.txt
 	$(CC) -Wall -DMK_DOC -o doc doc.c
 	./doc >/dev/null
 
 clean:
-	rm -f zmac.c doc.inl $(DEP)
+	rm -f zmac.c doc.inl y.tab.* $(DEP)
