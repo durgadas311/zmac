@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <errno.h>
 #include <string.h>
 #include "ld80.h"
@@ -150,7 +151,7 @@ int read_module(void)
 		"ld80: Module has no name in object file %s\n", objfilename);
 
 	while (read_item_buffered(&item, ENTRY_ELEMENT)) {
-		s = get_symbol(item.v.special.B_name);
+		s = get_symbol((char *)item.v.special.B_name);
 		if (s && s->value==UNDEFINED) {
 			s->value = 0;
 			load_this = 1;
@@ -183,7 +184,7 @@ int read_object_file(char *filename, int lib)
 
 	bitpos = 0;
 
-	objectfile=fopen(filename,"r");
+	objectfile=fopen(filename,"rb");
 	if (objectfile==NULL) die(E_USAGE,
 		"ld80: Cannot open object file %s: %s\n",
 		filename, sys_errlist[errno]);
@@ -251,9 +252,9 @@ void dump_item(struct object_item *item)
 			switch (item->v.special.B_name[0]) {
 			int operator;
 			case 'A':
-				operator = item->v.special.B_name[1] & 0xff;
+				operator = item->v.special.B_name[1];;
 				if (operator > 11) die(E_INPUT,
-					"ld80: Unknow operator %.2x\n",
+					"ld80: Unknown operator %.2x\n",
 					operator);
 				printf(" operator \"%s\"\n",
 					operators[operator]);
@@ -264,9 +265,9 @@ void dump_item(struct object_item *item)
 				break;
 			case 'C':
 				printf(" operand %.4x (%s)\n",
-					((item->v.special.B_name[3] & 0xff) << 8) +
-					(item->v.special.B_name[2] & 0xff),
-					atypes[item->v.special.B_name[1] & 0xff]);
+					(item->v.special.B_name[3] << 8) +
+					item->v.special.B_name[2],
+					atypes[item->v.special.B_name[1]]);
 				break;
 			default:
 				die(E_INPUT, "ld80: Unknown extension %.2x\n",

@@ -1,6 +1,6 @@
 %{
 // GWP - keep track of version via hand-maintained date stamp.
-#define VERSION "5nov2016"
+#define VERSION "28jul2018"
 
 /*
  *  zmac -- macro cross-assembler for the Zilog Z80 microprocessor
@@ -163,11 +163,25 @@
  *		substituion.  Change Pk=n to -Pk=n.  Add ++, += and variants
  *		for more compact variable adjustment than defl.  First crack
  *		at .tap output for ZX Spectrum support.
+ *
+ * gwp 13-8-17	Add "import" for simple once-only inclusion of files.
+ *		Track full path so relative includes work properly.
+ *		Allow push af', pop af' for notational convenience.
+ *		Add "bytes" as alias for "dc".  Fix --rel output bugs in
+ *		low(), high(), div and mod.
+ *
+ * gwp 12-3-18	250 baud .cas output and .wav format.  Common blocks.
+ *		--oo, --xo, --od to control output.  Delete output on fail.
+ *
+ * gwp 2-6-18	1000 baud .cas ouput and .mds (MAME/MESS debug script) output.
+ *
+ * gwp 28-7-18	Double free of output files bug fix from Pedro Gimeno.  Don't
+ *		output SYSTEM files if no entry point thanks to Tim Halloran.
  */
 
-#define MIO		/* use emulation routines from mio.c */
-
+#if defined(__GNUC__)
 #pragma GCC diagnostic error "-Wreturn-type"
+#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -179,6 +193,14 @@
 #ifdef WIN32
 #include <windows.h>	// just for colouring the output
 #include <direct.h>		// _mkdir
+#ifdef _MSC_VER
+#define strdup _strdup
+#define unlink _unlink
+#endif
+#endif
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <unistd.h>	// just for unlink
 #endif
 
 #include "zi80dis.h"
@@ -187,19 +209,7 @@
 #define unlink(filename) delete(filename)
 #endif
 
-#ifdef MIO
 #include "mio.h"
-
-FILE *mfopen();
-#else
-#define mfopen(filename,mode) fopen(filename,mode)
-#define mfclose(filename,mode) fclose(filename,mode) 
-#define mfputc(c,f) putc(c,f)
-#define mfgetc(f) getc(f)
-#define mfseek(f,loc,origin) fseek(f,loc,origin)
-#define mfread(ptr,size,nitems,f) fread(ptr,size,nitems,f)
-#define mfwrite(ptr,size,nitems,f) fread(ptr,size,nitems,f)
-#endif /* MIO */
 
 /*
  * DEBUG turns on pass reporting.
@@ -280,10 +290,12 @@ struct item *keyword(char *name);
 #define SCOPE_NONE	(0)
 #define SCOPE_PROGRAM	(1)
 #define SCOPE_DATA	(2)
+#define SCOPE_COMMON	(3)
 #define SCOPE_PUBLIC	(4)
 #define SCOPE_EXTERNAL	(8)
 #define SCOPE_NORELOC	(16)
 #define SCOPE_BUILTIN	(32)	/* abuse */
+#define SCOPE_COMBLOCK	(64)
 
 #define SCOPE_SEGMASK	(3)
 #define SCOPE_SEG(s)	((s) & SCOPE_SEGMASK)
@@ -305,12 +317,58 @@ FILE	*fout,
 	*fcmd,
 	*fcas,
 	*flcas,
+	*flnwcas,
+	*ftcas,
 	*fcim,
 	*fams,
 	*frel,
 	*ftap,
+	*fmds,
+	*f1500wav,
+	*f1000wav,
+	*f500wav,
+	*f250wav,
 	*fin[NEST_IN],
 	*now_file ;
+
+char *output_dir = "zout";
+
+struct OutputFile {
+	char *suffix;
+	char *mode;
+	FILE **fpp;
+	int system; // A cassette SYSTEM file
+	int no_open;
+	int wanted; // output file has been explicitly selected
+	char *filename;
+	int temp;
+}
+outf[] = {
+	{ "lst",	"w",	&fout		},
+	{ "hex", 	"w",	&fbuf		},
+	{ "bds",	"w",	&fbds		},
+	{ "cmd",	"wb",	&fcmd		},
+	{ "1500.wav",	"wb",	&f1500wav, 1	}, // must be 1 before 1500.cas
+	{ "1500.cas",	"w+b",	&fcas,	   1	},
+	{ "1000.wav",	"wb",	&f1000wav, 1	}, // must be 1 before 1000.cas
+	{ "1000.cas",	"w+b",	&flnwcas,  1	},
+	{ "500.wav",	"wb",	&f500wav,  1	}, // must be 1 before 500.cas
+	{ "500.cas",	"w+b",	&flcas,    1	},
+	{ "250.wav",	"wb",	&f250wav	}, // must be 1 before 250.cas
+	{ "250.cas",	"w+b",	&ftcas		},
+	{ "cim",	"wb",	&fcim		},
+	{ "ams",	"wb",	&fams		},
+	{ "rel",	"wb",	&frel,	0, 1	},
+	{ "tap",	"wb",	&ftap		},
+	{ "mds",	"w",	&fmds		},
+};
+#define CNT_OUTF (sizeof outf / sizeof outf[0])
+
+int getoptarg(int argc, char *argv[], int i);
+void stop_all_outf();
+void clean_outf();
+void clean_outf_temp();
+void suffix_list(char *sfx_lst, int no_open);
 
 int	pass2;	/*set when pass one completed*/
 int	outpass; 	// set when we decide to stop doing passes */
@@ -319,7 +377,7 @@ int	passretry;	// set when an inconsistency will require another pass
 int	dollarsign ;	/* location counter */
 int	olddollar ;	/* kept to put out binary */
 int	oldothdollar;	// output address of next .cmd/.cas/.lcas block
-int	emit_addr;	// were code and data are being placed in memory
+int	emit_addr;	// where code and data are being placed in memory
 int	tstates;	// cumulative T-states
 int	ocf;		// cumulative op code fetches
 int	llseq;		// local label sequence number
@@ -495,13 +553,10 @@ char	*sourcef;
 /* changed to cope with filenames longer than 14 chars -rjm 1998-12-15 */
 char	src[1024];
 char	bin[1024];
-char	mtmp[1024];
 char	listf[1024];
-char	bds[1024];
 char	oth[1024];
 
-char	bopt = 1,
-	copt = 1,	/* cycle counts in listings by default */
+char	copt = 1,	/* cycle counts in listings by default */
 	edef = 1,
 	eopt = 1,
 	fdef = 0,
@@ -513,11 +568,9 @@ char	bopt = 1,
 	JPopt = 0,
 	lstoff = 0,
 	lston = 0,	/* flag to force listing on */
-	lopt = 0,
 	mdef = 0,
 	mopt = 0,
 	nopt = 1 ,	/* line numbers on as default */
-	oopt = 0,
 	popt = 1,	/* form feed as default page eject */
 	sopt = 0,	/* turn on symbol table listing */
 	topt = 1,	/* terse, only error count to terminal */
@@ -594,10 +647,12 @@ int segment;
 #define SEG_ABS		(0)
 #define SEG_CODE	(1)
 #define SEG_DATA	(2)
+#define SEG_COMMON	(3)
 int seg_pos[4]; // may eventually support SEG_COMMON
 int seg_size[4];
 int rel_main;
 int segchange;
+struct item *cur_common;
 void putout(int value);
 int outrec;
 int outlen;
@@ -649,11 +704,15 @@ void flushrel(void);
 void lsterr1();
 void lsterr2(int lst);
 void copyname(char *st1, char *st2);
-void next_source(char *sp);
+void next_source(char *sp, int always);
 void incbin(char *filename);
 void dc(int count, int value);
 char *getmraslocal();
 void write_tap(int len, int org, unsigned char *data);
+void write_250(int low, int high);
+void writewavs(int pad250, int pad500, int pad1500);
+void reset_import();
+int imported(char *filename);
 
 #define RELCMD_PUBLIC	(0)
 #define RELCMD_COMMON	(1)
@@ -1081,7 +1140,7 @@ void checkjp(int op, struct expr *dest)
  */
 void putbin(int v)
 {
-	if(!outpass || !bopt) return;
+	if(!outpass) return;
 	*outbinp++ = v;
 	if (outbinp >= outbinm) flushbin();
 
@@ -1099,23 +1158,25 @@ void flushbin()
 	char *p;
 	int check=outbinp-outbin;
 
-	if (!outpass || !bopt)
+	if (!outpass)
 		return;
 	nbytes += check;
 	if (check) {
-		putc(':', fbuf);
-		puthex(check, fbuf);
-		puthex(olddollar>>8, fbuf);
-		puthex(olddollar, fbuf);
-		puthex(0, fbuf);
-		check += (olddollar >> 8) + olddollar;
-		olddollar += (outbinp-outbin);
-		for (p=outbin; p<outbinp; p++) {
-			puthex(*p, fbuf);
-			check += *p;
+		if (fbuf) {
+			putc(':', fbuf);
+			puthex(check, fbuf);
+			puthex(olddollar>>8, fbuf);
+			puthex(olddollar, fbuf);
+			puthex(0, fbuf);
+			check += (olddollar >> 8) + olddollar;
+			olddollar += (outbinp-outbin);
+			for (p=outbin; p<outbinp; p++) {
+				puthex(*p, fbuf);
+				check += *p;
+			}
+			puthex(256-check, fbuf);
+			putc('\n', fbuf);
 		}
-		puthex(256-check, fbuf);
-		putc('\n', fbuf);
 		outbinp = outbin;
 	}
 }
@@ -1165,11 +1226,13 @@ void flushoth()
 {
 	int i, checksum;
 
-	if (!outpass || !bopt || outoth_cnt == 0)
+	if (!outpass || outoth_cnt == 0)
 		return;
 
-	fprintf(fcmd, "%c%c%c%c", 1, outoth_cnt + 2, oldothdollar, oldothdollar >> 8);
-	fwrite(outoth, outoth_cnt, 1, fcmd);
+	if (fcmd) {
+		fprintf(fcmd, "%c%c%c%c", 1, outoth_cnt + 2, oldothdollar, oldothdollar >> 8);
+		fwrite(outoth, outoth_cnt, 1, fcmd);
+	}
 
 	putcas(0x3c);
 	putcas(outoth_cnt);
@@ -1179,6 +1242,8 @@ void flushoth()
 	for (i = 0; i < outoth_cnt; i++) {
 		putcas(outoth[i]);
 		checksum += outoth[i];
+		if (fmds)
+			fprintf(fmds, "b@$%04x=$%02x\n", oldothdollar + i, outoth[i] & 0xff);
 	}
 	putcas(checksum);
 
@@ -1190,14 +1255,20 @@ int casbit, casbitcnt = 0;
 
 void putcas(int byte)
 {
-	fputc(byte, flcas);
+	if (flcas)
+		fputc(byte, flcas);
 
-	// Buffer 0 stop bit and the 8 data bits.
-	casbit = (casbit << 9) | (byte & 0xff);
-	casbitcnt += 9;
-	while (casbitcnt >= 8) {
-		casbitcnt -= 8;
-		fputc(casbit >> casbitcnt, fcas);
+	if (flnwcas)
+		fputc(byte, flnwcas);
+
+	if (fcas) {
+		// Buffer 0 stop bit and the 8 data bits.
+		casbit = (casbit << 9) | (byte & 0xff);
+		casbitcnt += 9;
+		while (casbitcnt >= 8) {
+			casbitcnt -= 8;
+			fputc(casbit >> casbitcnt, fcas);
+		}
 	}
 }
 
@@ -1372,7 +1443,7 @@ void list_out(int optarg, char *line_str, char type)
 			fputs(line_str, fout);
 		}
 
-		if (bopt) {
+		if (fbds) {
 			if (emitptr > emitbuf) {
 				fprintf(fbds, "%04x %04x d ", dollarsign, emit_addr);
 				for (p = emitbuf; p < emitptr; p++)
@@ -1380,10 +1451,10 @@ void list_out(int optarg, char *line_str, char type)
 				fprintf(fbds, "\n");
 			}
 			fprintf(fbds, "%04x %04x s %s", dollarsign, emit_addr, line_str);
-
-			for (p = emitbuf; p < emitptr; p++)
-				putbin(*p);
 		}
+
+		for (p = emitbuf; p < emitptr; p++)
+			putbin(*p);
 
 
 		p = emitbuf+4;
@@ -1416,7 +1487,7 @@ void list_out(int optarg, char *line_str, char type)
  */
 void lineout()
 {
-	if (!printer_output)
+	if (!printer_output || !fout)
 		return;
 
 	if (line == 60) {
@@ -1440,7 +1511,7 @@ void lineout()
  */
 void eject()
 {
-	if (printer_output)
+	if (!printer_output)
 		return;
 
 	if (outpass && iflist()) {
@@ -1463,7 +1534,7 @@ void eject()
 void space(int n)
 {
 	int	i ;
-	if (outpass && iflist())
+	if (outpass && iflist() && fout)
 		for (i = 0; i<n; i++) {
 			lineout();
 			putc('\n', fout);
@@ -1504,8 +1575,9 @@ void lsterr2(int lst)
 					type = "";
 				}
 				lineout();
-				fprintf(fout, "%c %s%s\n",
-					errlet[i], desc, type);
+				if (fout)
+					fprintf(fout, "%c %s%s\n",
+						errlet[i], desc, type);
 			}
 			err[i] = 0;
 			keeperr[i]++;
@@ -1513,7 +1585,8 @@ void lsterr2(int lst)
 				errorprt(i);
 		}
 
-	fflush(fout);	/*to avoid putc(har) mix bug*/
+	if (fout)
+		fflush(fout);	/*to avoid putc(har) mix bug*/
 }
 
 /*
@@ -1567,7 +1640,7 @@ void list1()
 			fprintf(fout, "\t\t%s", linebuf);
 			lsterr2(lst);
 		}
-		if (bopt)
+		if (fbds)
 			fprintf(fbds, "%04x %04x s %s", dollarsign, emit_addr, linebuf);
 	}
 	else
@@ -1582,13 +1655,14 @@ int iflist()
 {
 	int i, j;
 
+	if (!fout)
+		return 0;
+
 	if (inmlex)
 		return mlex_list_on;
 
 	if (lston)
 		return(1) ;
-	if (lopt)
-		return(0);
 	if (*ifptr && !fopt)
 		return(0);
 	if (!lstoff && !expptr)
@@ -1620,6 +1694,8 @@ void do_defl(struct item *sym, struct expr *val, int call_list);
 #define PSWSYM	(2)	/* wsym */
 #define PSINC	(3)	/* include file */
 #define PSMACLIB (4)	/* maclib (similar to include) */
+#define PSIMPORT (5)	/* import file */
+#define PSCMN	(6)	/* common block */
 
 #define SPTITL	(0)	/* title */
 #define SPSBTL	(1)	/* sub title */
@@ -1699,6 +1775,7 @@ void do_defl(struct item *sym, struct expr *val, int call_list);
 %token <itemptr> EQUATED
 %token <itemptr> WASEQUATED
 %token <itemptr> DEFLED
+%token <itemptr> COMMON
 %token <itemptr> MULTDEF
 %token <ival> SHL
 %token <ival> SHR
@@ -1861,6 +1938,63 @@ void do_end(struct expr *entry)
 //	else
 //		peekc = 0;
 
+}
+
+void common_block(char *unparsed_id)
+{
+	struct item *it;
+	char *id = unparsed_id;
+	char *p;
+	int unnamed;
+
+	if (*id == '/') {
+		id++;
+		for (p = id; *p; p++)
+			if (*p == '/')
+				*p = '\0';
+	}
+
+	unnamed = 1;
+	for (p = id; *p; p++)
+		if (*p != ' ')
+			unnamed = 0;
+
+	id = unnamed ? " " : id;
+
+	it = locate(id);
+	switch (it->i_token) {
+	case 0:
+		nitems++;
+	case UNDECLARED:
+	case COMMON:
+		it->i_value = 0;
+		it->i_token = COMMON;
+		it->i_pass = npass;
+		it->i_scope = SCOPE_COMBLOCK;
+		it->i_uses = 0;
+		if (!it->i_string)
+			it->i_string = strdup(id);
+		break;
+	default:
+		err[mflag]++;
+		it->i_token = MULTDEF;
+		it->i_pass = npass;
+			it->i_string = strdup(id);
+		break;
+	}
+
+	// Even if we change to the same COMMON block the address is
+	// reset back to 0.
+	if (relopt) {
+		segment = SEG_COMMON;
+		segchange = 1;
+		dollarsign = seg_pos[SEG_COMMON] = seg_size[SEG_COMMON] = 0;
+		// May not be necessary but too much trouble to suppress.
+		putrelcmd(RELCMD_COMMON);
+		putrelname(it->i_string);
+	}
+
+	cur_common = it;
 }
 
 %}
@@ -2098,19 +2232,30 @@ statement:
 			if (mras && !strchr(tempbuf, '.')) {
 				strcat(tempbuf, ".asm");
 			}
-			next_source(tempbuf);
+			next_source(tempbuf, 1);
 			break ;
+		case PSIMPORT:	/* import file */
+			next_source(tempbuf, 0);
+			break;
 		case PSMACLIB:
 			strcat(tempbuf, ".lib");
-			next_source(tempbuf);
+			next_source(tempbuf, 1);
+			break;
+		case PSCMN:
+			common_block(tempbuf);
 			break;
 		}
 	}
 |
 	ARGPSEUDO arg_on arg_off '\n' {
-		fprintf(stderr, "Missing argument of '%s'\n", $1->i_string);
-		err[fflag]++;
-		list(dollarsign);
+		if ($1->i_value == PSCMN) {
+			common_block(" ");
+		}
+		else {
+			fprintf(stderr, "Missing argument of '%s'\n", $1->i_string);
+			err[fflag]++;
+		}
+		list1();
 	}
 |
 	label.part INCBIN arg_on ARG arg_off '\n' {
@@ -2164,8 +2309,11 @@ statement:
 			break;
 
 		case SPPRAGMA:
-			if (strncmp(tempbuf, "bds", 3) == 0 && bopt && outpass) {
+			if (strncmp(tempbuf, "bds", 3) == 0 && fbds && outpass) {
 				fprintf(fbds, "%s\n", tempbuf + 4);
+			}
+			if (strncmp(tempbuf, "mds", 3) == 0 && fmds && outpass) {
+				fprintf(fmds, "%s\n", tempbuf + 4);
 			}
 			list1();
 			break;
@@ -2546,7 +2694,8 @@ public.list:
 
 public.part:
 	symbol {
-		$1->i_scope |= SCOPE_PUBLIC;
+		if (!($1->i_scope & SCOPE_COMBLOCK))
+			$1->i_scope |= SCOPE_PUBLIC;
 		// Just being "public" does not #ifdef define a symbol.
 		if (pass2) {
 			if ($1->i_token == UNDECLARED) {
@@ -3127,7 +3276,7 @@ operation:
 		{ emit(2, E_CODE, 0, 0355, 0100 + ($2 << 3)); }
 |
 	INP realreg
-		{ emit(2, E_CODE, 0, 0355, 0101 + ($2 << 3)); }
+		{ emit(2, E_CODE, 0, 0355, 0100 + ($2 << 3)); }
 |
 	TK_IN 'F' ',' '(' TK_C ')'
 		{ emit(2, E_CODE, 0, 0355, 0160); }
@@ -3221,8 +3370,11 @@ operation:
 				dollarsign = $2->e_value;
 				emit_addr = $2->e_value;
 				seg_pos[segment] = dollarsign;
-				if (seg_pos[segment] > seg_size[segment])
+				if (seg_pos[segment] > seg_size[segment]) {
 					seg_size[segment] = seg_pos[segment];
+					if (segment == SEG_COMMON && cur_common)
+						cur_common->i_value = seg_size[segment];
+				}
 				putrelcmd(RELCMD_SETLOC);
 				putrelsegref(segment, seg_pos[segment]);
 				segchange = 0;
@@ -3455,6 +3607,11 @@ pushable:
 			$$ = $1->i_value;
 		}
 |
+	AFp
+		{
+			$$ = 060;
+		}
+|
 	mar
 ;
 pushable8:
@@ -3635,6 +3792,11 @@ noparenexpr:
 			$$ = expr_var($1);
 		}
 |
+	COMMON
+		{
+			$$ = expr_var($1);
+		}
+|
 	'$'
 		{
 			$$ = expr_num(dollarsign + emitptr - emitbuf);
@@ -3796,22 +3958,22 @@ noparenexpr:
 |
 	LOW expression %prec UNARY
 		{
-			$$ = expr_op($2, $1, 0, $2->e_value & 0xff);
+			$$ = expr_op($2, LOW, 0, $2->e_value & 0xff);
 		}
 |
 	MROP_LOW expression
 		{
-			$$ = expr_op($2, $1, 0, $2->e_value & 0xff);
+			$$ = expr_op($2, LOW, 0, $2->e_value & 0xff);
 		}
 |
 	HIGH expression %prec UNARY
 		{
-			$$ = expr_op($2, $1, 0, ($2->e_value >> 8) & 0xff);
+			$$ = expr_op($2, HIGH, 0, ($2->e_value >> 8) & 0xff);
 		}
 |
 	MROP_HIGH expression
 		{
-			$$ = expr_op($2, $1, 0, ($2->e_value >> 8) & 0xff);
+			$$ = expr_op($2, HIGH, 0, ($2->e_value >> 8) & 0xff);
 		}
 ;
 
@@ -3827,6 +3989,8 @@ symbol:
 	WASEQUATED
 |
 	DEFLED
+|
+	COMMON
 ;
 
 
@@ -3972,6 +4136,7 @@ struct	item	keytab[] = {
 	{"bity",	0xfd46,	BIT_XY,		VERB | Z80 | ZNONSTD },
 	{".block",	0,	DEFS,		VERB },
 	{".byte",	0,	DEFB,		VERB },
+	{".bytes",	0,	DC,		VERB },
 	{"c",		1,	TK_C,		I8080 | Z80 },
 	{"call",	0315,	CALL,		VERB | I8080 | Z80 },
 	{"cc",		0334,	CALL8,		VERB | I8080 },
@@ -3989,6 +4154,7 @@ struct	item	keytab[] = {
 	{"cnc",		0324,	CALL8,		VERB | I8080 },
 	{"cnz",		0304,	CALL8,		VERB | I8080 },
 	{".comment",	SPCOM,	SPECIAL,	VERB },
+	{".common",	PSCMN,	ARGPSEUDO,	VERB },
 	{".cond",	0,	IF_TK,		VERB },
 	{"cp",		7,	LOGICAL,	VERB | I8080 | Z80 },
 	{"cpd",		0166651,NOOPERAND,	VERB | Z80 },
@@ -4071,6 +4237,7 @@ struct	item	keytab[] = {
 	{"im0",		0xed46,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"im1",		0xed56,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"im2",		0xed5e,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{".import",	PSIMPORT,ARGPSEUDO,	VERB },
 	{"in",		0333,	TK_IN,		VERB | I8080 | Z80 },
 	{"inc",		0,	INCDEC,		VERB | Z80 },
 	{".incbin", 	0, 	INCBIN,		VERB },
@@ -4867,6 +5034,7 @@ int convert(char *buf, char *bufend, int *overflow)
 		default:
 			radix = 10;
 			dn++;
+			break;
 		}
 	}
 
@@ -5003,7 +5171,7 @@ struct item *item_substr_lookup(char *name, int token, struct item *table, int t
 	int i;
 
 	for (i = 0; i < table_size; i++) {
-		int len;
+		unsigned int len;
 
 		if (table[i].i_token != token)
 			continue;
@@ -5325,7 +5493,7 @@ int nextchar()
 					lineout();
 					fprintf(fout, "**** %s ****\n", src_name[now_in]) ;
 				}
-				if (bopt)
+				if (fbds)
 					fprintf(fbds, "%04x %04x f %s\n", dollarsign, emit_addr, src_name[now_in]);
 			}
 
@@ -5539,20 +5707,15 @@ int skipline(int ac)
 
 void add_incpath(char *dir)
 {
-	char *p;
-
 	if (incpath_cnt >= MAXINCPATH) {
 		fprintf(stderr, "Sorry, can only handle %d include paths\n", MAXINCPATH);
 		exit(1);
 	}
 
-	p = malloc(strlen(dir) + 1);
-	strcpy(p, dir);
-
-	incpath[incpath_cnt++] = dir;
+	incpath[incpath_cnt++] = strdup(dir);
 }
 
-FILE *open_incpath(char *filename, char *mode)
+FILE *open_incpath(char *filename, char *mode, char **path_used)
 {
 	char quote;
 	int i;
@@ -5579,6 +5742,9 @@ FILE *open_incpath(char *filename, char *mode)
 	strcat(path, filename);
 	fp = fopen(path, mode);
 	if (fp) {
+		if (path_used)
+			*path_used = strdup(path);
+
 		if (note_depend && outpass)
 			printf("%s\n", path);
 		return fp;
@@ -5588,6 +5754,8 @@ FILE *open_incpath(char *filename, char *mode)
 		sprintf(path, "%s/%s", incpath[i], filename);
 		fp = fopen(path, mode);
 		if (fp) {
+			if (path_used)
+				*path_used = strdup(path);
 			if (note_depend && outpass)
 				printf("%s\n", path);
 			return fp;
@@ -5597,12 +5765,16 @@ FILE *open_incpath(char *filename, char *mode)
 	if (note_depend && outpass)
 		printf("%s\n", filename);
 
-	return fopen(filename, mode);
+	fp = fopen(filename, mode);
+	if (fp && path_used)
+		*path_used = strdup(filename);
+
+	return fp;
 }
 
 void version()
 {
-	fprintf(stderr, "zmac version " VERSION "\n");
+	fprintf(stderr, "zmac version " VERSION "        http://48k.ca/zmac.html\n");
 }
 
 //
@@ -5623,34 +5795,38 @@ void help()
 {
 	version();
 
-	fprintf(stderr, "\t--version show version number\n");
-	fprintf(stderr, "\t--help\tshow this help message\n");
-	fprintf(stderr, "\t-8\tuse 8080 interpretation of mnemonics\n");
-	fprintf(stderr, "\t-b\tno binary (.hex,.cmd,.cas, etc.) output\n");
-	fprintf(stderr, "\t-c\tno cycle counts in listing\n");
-	fprintf(stderr, "\t-e\terror list only\n");
-	fprintf(stderr, "\t-f\tprint if skipped lines\n");
-	fprintf(stderr, "\t-g\tdo not list extra code\n");
-	fprintf(stderr, "\t-h\tshow this information about options and quit\n");
-	fprintf(stderr, "\t-i\tdo not list include files\n");
-	fprintf(stderr, "\t-I dir\tadd 'dir' to include file search path\n");
-	fprintf(stderr, "\t-j\tpromote relative jumps to absolute as needed\n");
-	fprintf(stderr, "\t-J\twarn when a jump could be relative\n");
-	fprintf(stderr, "\t-l\tno list\n");
-	fprintf(stderr, "\t-L\tforce listing of everything\n");
-	fprintf(stderr, "\t-m\tprint macro expansions\n");
-	fprintf(stderr, "\t-n\tput line numbers off\n");
-	fprintf(stderr, "\t-o\tlist to standard output\n");
-	fprintf(stderr, "\t-p\tput out four \\n's for eject\n");
-	fprintf(stderr, "\t-s\tdon't produce a symbol list\n");
-	fprintf(stderr, "\t-t\toutput error count instead of list of errors\n");
-	fprintf(stderr, "\t-z\tuse Z-80 interpretation of mnemonics\n");
-	fprintf(stderr, "\t-Pk=num\tset @@k to num before assembly (e.g., -P4=10)\n");
-	fprintf(stderr, "\t--dep\tlist files included\n");
-	fprintf(stderr, "\t--mras\tlimited MRAS/EDAS compatibility\n");
-	fprintf(stderr, "\t--rel\toutput .rel file only (--rel7 for 7 character symbol names)\n");
-	fprintf(stderr, "\t--zmac\tcompatibility with original zmac\n");
-	fprintf(stderr, "\t--doc\toutput documentation as HTML file\n");
+	fprintf(stderr, "   --version\tshow version number\n");
+	fprintf(stderr, "   --help\tshow this help message\n");
+	fprintf(stderr, "   -8\t\tuse 8080 interpretation of mnemonics\n");
+	fprintf(stderr, "   -b\t\tno binary (.hex,.cmd,.cas, etc.) output\n");
+	fprintf(stderr, "   -c\t\tno cycle counts in listing\n");
+	fprintf(stderr, "   -e\t\terror list only\n");
+	fprintf(stderr, "   -f\t\tprint if skipped lines\n");
+	fprintf(stderr, "   -g\t\tdo not list extra code\n");
+	fprintf(stderr, "   -h\t\tshow this information about options and quit\n");
+	fprintf(stderr, "   -i\t\tdo not list include files\n");
+	fprintf(stderr, "   -I dir\tadd 'dir' to include file search path\n");
+	fprintf(stderr, "   -j\t\tpromote relative jumps to absolute as needed\n");
+	fprintf(stderr, "   -J\t\twarn when a jump could be relative\n");
+	fprintf(stderr, "   -l\t\tlist to standard output\n");
+	fprintf(stderr, "   -L\t\tforce listing of everything\n");
+	fprintf(stderr, "   -m\t\tprint macro expansions\n");
+	fprintf(stderr, "   -n\t\tput line numbers off\n");
+	fprintf(stderr, "   -o file.hex\toutput only named file (multiple -o allowed)\n");
+	fprintf(stderr, "   -p\t\tput out four \\n's for eject\n");
+	fprintf(stderr, "   -P\t\tformat listing for a printer\n");
+	fprintf(stderr, "   -s\t\tdon't produce a symbol list\n");
+	fprintf(stderr, "   -t\t\toutput error count instead of list of errors\n");
+	fprintf(stderr, "   -z\t\tuse Z-80 interpretation of mnemonics\n");
+	fprintf(stderr, "   -Pk=num\tset @@k to num before assembly (e.g., -P4=10)\n");
+	fprintf(stderr, "   --od\tdir\tdirectory unnamed output files (default \"zout\")\n");
+	fprintf(stderr, "   --oo\thex,cmd\toutput only listed file suffix types\n");
+	fprintf(stderr, "   --xo\tlst,cas\tdo not output listed file suffix types\n");
+	fprintf(stderr, "   --dep\tlist files included\n");
+	fprintf(stderr, "   --mras\tlimited MRAS/EDAS compatibility\n");
+	fprintf(stderr, "   --rel\toutput .rel file only (--rel7 for 7 character symbol names)\n");
+	fprintf(stderr, "   --zmac\tcompatibility with original zmac\n");
+	fprintf(stderr, "   --doc\toutput documentation as HTML file\n");
 
 	exit(0);
 }
@@ -5658,16 +5834,19 @@ void help()
 int main(int argc, char *argv[])
 {
 	struct item *ip;
-	int  i;
+	int  i, j;
 	int  files;
+	int used_o;
+	int used_oo;
 #ifdef DBUG
 	extern  yydebug;
 #endif
 
-	fout = stdout ;
-	fin[0] = stdin ;
-	now_file = stdin ;
+	fin[0] = stdin;
+	now_file = stdin;
 	files = 0;
+	used_o = 0;
+	used_oo = 0;
 
 	// Special flag for unit testing.
 	if (argc > 1 && strcmp(argv[1], "--test") == 0)
@@ -5683,13 +5862,11 @@ int main(int argc, char *argv[])
 
 		if (strcmp(argv[i], "--rel") == 0) {
 			relopt = 6;
-			bopt = 0;
 			continue;
 		}
 
 		if (strcmp(argv[i], "--rel7") == 0) {
 			relopt = 7;
-			bopt = 0;
 			continue;
 		}
 
@@ -5719,6 +5896,26 @@ int main(int argc, char *argv[])
 			version();
 			exit(0);
 			continue; // not reached
+		}
+
+		if (strcmp(argv[i], "--od") == 0) {
+			output_dir = argv[i = getoptarg(argc, argv, i)];
+			continue;
+		}
+
+		if (strcmp(argv[i], "--oo") == 0) {
+			if (!used_oo)
+				stop_all_outf();
+
+			suffix_list(argv[i = getoptarg(argc, argv, i)], 0);
+
+			used_oo = 1;
+			continue;
+		}
+
+		if (strcmp(argv[i], "--xo") == 0) {
+			suffix_list(argv[i = getoptarg(argc, argv, i)], 1);
+			continue;
 		}
 
 		if (argv[i][0] == '-' && argv[i][1] == 'P' &&
@@ -5756,7 +5953,9 @@ int main(int argc, char *argv[])
 				continue;
 
 			case 'b':	/*  no binary  */
-				bopt = 0;
+				for (j = 0; j < CNT_OUTF; j++)
+					if (strcmp(outf[j].suffix, "lst") != 0)
+						outf[j].no_open = 1;
 				continue;
 
 			case 'c':	/*  no cycle counts in listing */
@@ -5795,18 +5994,13 @@ int main(int argc, char *argv[])
 			case 'I':
 				if (argv[i][1])
 					add_incpath(argv[i] + 1);
-				else {
-					i++;
-					if (i < argc)
-						add_incpath(argv[i]);
-					else
-						usage("missing argument to -I option", 0);
-				}
+				else
+					add_incpath(argv[i = getoptarg(argc, argv, i)]);
 				skip = 1;
 				break;
 
-			case 'l':	/*  no list  */
-				lopt++;
+			case 'l':	/*  list to stdout */
+				fout = stdout;
 				continue;
 
 			case 'L':	/*  force listing of everything */
@@ -5830,9 +6024,40 @@ int main(int argc, char *argv[])
 				nopt-- ;
 				continue;
 
-			case 'o':	/*  list to standard output  */
-				oopt++;
-				continue;
+			case 'o':	/*  select output */
+				{
+					char *outfile = 0;
+					char *sfx;
+					int found = 0;
+
+					if (!used_o)
+						stop_all_outf();
+
+					if (argv[i][1])
+						outfile = argv[i] + 1;
+					else
+						outfile = argv[i = getoptarg(argc, argv, i)];
+
+					for (sfx = outfile; !found && *sfx; sfx++) {
+						if (*sfx != '.')
+							continue;
+
+						for (j = 0; j < CNT_OUTF; j++) {
+							if (ci_strcmp(sfx + 1, outf[j].suffix) == 0) {
+								outf[j].no_open = 0;
+								outf[j].wanted = 1;
+								outf[j].filename = outfile;
+								found = 1;
+								break;
+							}
+						}
+					}
+					if (!found)
+						usage("output file '%s' has unknown suffix", outfile);
+				}
+				used_o = 1;
+				skip = 1;
+				break;
 
 			case 'p':	/*  put out four \n's for eject */
 				popt-- ;
@@ -5881,101 +6106,90 @@ int main(int argc, char *argv[])
 	if (files == 0)
 		usage("No source file", 0);
 
-	{
-		char outdir[1025];
-		outpath(outdir, sourcef, 0);
-#ifdef WIN32
-		_mkdir(outdir);
-#else
-		mkdir(outdir, 0777);
-#endif
-	}
+	// .wav file outputs must ensure their .cas antecedents are generated.
+	// And also check for .rel output and set relopt while we're at it.
+	for (j = 0; j < CNT_OUTF; j++) {
+		char *p;
 
-	if (bopt) {
-		outpath(bds, sourcef, ".bds");
-		fbds = fopen(bds, "w");
-		if (fbds == NULL)
-			error("Cannot create .bds file");
+		if (strcmp(outf[j].suffix, "rel") == 0 && !outf[j].no_open)
+			relopt = 1;
 
-		fprintf(fbds, "binary-debuggable-source\n");
+		p = strchr(outf[j].suffix, '.');
+		// Only .wav file that open matter and only if .cas doesn't open.
+		if (!p || strcmp(p, ".wav") != 0 || outf[j].no_open || !outf[j + 1].no_open)
+			continue;
 
-		fprintf(fbds, "%04x %04x f %s\n", dollarsign, emit_addr, src_name[now_in]);
-
-		outpath(oth, sourcef, ".cmd");
-		fcmd = fopen(oth, "wb");
-		if (fcmd == NULL)
-			error("Cannot create .cmd file");
-
-		outpath(oth, sourcef, ".cas");
-		fcas = fopen(oth, "wb");
-		if (fcas == NULL)
-			error("Cannot create .cas file");
-
-		outpath(oth, sourcef, ".lcas");
-		flcas = fopen(oth, "wb");
-		if (flcas == NULL)
-			error("Cannot create .lcas file");
-
-		// Tape header
-		for (i = 0; i < 255; i++) {
-			fputc(0, flcas);
-			fputc(0x55, fcas);
+		outf[j + 1].no_open = 0;
+		outf[j + 1].temp = 1;
+		if (outf[j].filename) {
+			// Replace .wav suffix with .cas.  This is safe for
+			// now as only -o can choose a filename and it must end
+			// with outf[j]'s suffix to be put in outf[j].
+			outf[j + 1].filename = strdup(outf[j].filename);
+			p = strrchr(outf[j + 1].filename, '.');
+			strcpy(p + 1, "cas");
 		}
-		fputc(0xA5, flcas);
-		fputc(0x7F, fcas);
-		casname(oth, sourcef, 6);
-		putcas(0x55);
-		for (i = 0; i < 6; i++)
-			putcas(oth[i]);
-
-		outpath(oth, sourcef, ".cim");
-		fcim = fopen(oth, "wb");
-		if (fcim == NULL)
-			error("Cannot create .cim file");
-
-		outpath(oth, sourcef, ".ams");
-		fams = fopen(oth, "wb");
-		if (fams == NULL)
-			error("Cannot create .ams file");
-
-		outpath(oth, sourcef, ".tap");
-		ftap = fopen(oth, "wb");
-		if (ftap == NULL)
-			error("Cannot create .tap file");
-
-		outpath(bin, sourcef, ".hex");
-#ifdef MSDOS
-		if (( fbuf = fopen(bin, "wb")) == NULL)
-#else
-		if (( fbuf = fopen(bin, "w")) == NULL)
-#endif
-			error("Cannot create .hex file");
 	}
-	else if (relopt) {
-		outpath(oth, sourcef, ".rel");
-		frel = fopen(oth, "wb");
-		if (frel == NULL)
-			error("Cannot create .rel file");
 
+	if (relopt) {
+		for (j = 0; j < CNT_OUTF; j++) {
+			if (strcmp(outf[j].suffix, "lst") != 0)
+			{
+				outf[j].no_open = strcmp(outf[j].suffix, "rel") != 0;
+			}
+		}
+	}
+
+	for (j = 0; j < CNT_OUTF; j++) {
+		if (outf[j].no_open || *outf[j].fpp)
+			continue;
+
+		if (!outf[j].filename) {
+			char suffix[32];
+			strcpy(suffix, ".");
+			strcat(suffix, outf[j].suffix);
+			outpath(oth, sourcef, suffix);
+			outf[j].filename = strdup(oth);
+		}
+
+		*outf[j].fpp = fopen(outf[j].filename, outf[j].mode);
+		if (!*outf[j].fpp) {
+			fprintf(stderr, "Cannot create file '%s'", outf[j].filename);
+			clean_outf();
+			exit(1);
+		}
+	}
+
+	if (fbds) {
+		fprintf(fbds, "binary-debuggable-source\n");
+		fprintf(fbds, "%04x %04x f %s\n", dollarsign, emit_addr, src_name[now_in]);
+	}
+
+	// Tape header
+	for (i = 0; i < 255; i++) {
+		if (flcas) fputc(0, flcas);
+		if (flnwcas) fputc(0, flnwcas);
+		if (fcas) fputc(0x55, fcas);
+		if (ftcas) fputc(0, ftcas);
+	}
+	if (flcas) fputc(0xA5, flcas);
+	if (flnwcas) fputc(0xA5, flnwcas);
+	if (fcas) fputc(0x7F, fcas);
+	if (ftcas) fputc(0xA5, ftcas);
+
+	casname(oth, sourcef, 6);
+	putcas(0x55);
+	for (i = 0; i < 6; i++)
+		putcas(oth[i]);
+
+	if (relopt) {
 		strncpy(progname, basename(sourcef), sizeof progname);
 		progname[sizeof progname - 1] = '\0';
 	}
-	if (!lopt && !oopt) {
-		outpath(listf, sourcef, ".lst");
-		if ((fout = fopen(listf, "w")) == NULL)
-			error("Cannot create list file");
-	} else
-		fout = stdout ;
-	outpath(mtmp, sourcef, ".tmp");
-#ifdef MSDOS
-	mfile = mfopen(mtmp,"w+b") ;
-#else
-	mfile = mfopen(mtmp,"w+") ;
-#endif
-	if (mfile == NULL) {
-		error("Cannot create temp file");
-	}
-	/*unlink(mtmp);*/
+
+	// mfopen() is always in-memory not a temporary file.
+
+	mfile = mfopen("does-not-matter","w+b") ;
 
 	/*
 	 *  get the time
@@ -6011,9 +6225,7 @@ int main(int argc, char *argv[])
 			putrelname(progname);
 		}
 
-		ip = itemtab;
-		ip--;
-		while (++ip < itemmax) {
+		for (ip = itemtab - 1; ++ip < itemmax; ) {
 			// Output list of public labels.  m80 will let
 			// equates and aseg values be public so we do, too.
 			if (outpass && ip->i_token && (ip->i_scope & SCOPE_PUBLIC)) {
@@ -6052,6 +6264,18 @@ int main(int argc, char *argv[])
 			putrelsegref(SEG_CODE, seg_size[SEG_CODE]);
 		}
 
+		for (ip = itemtab - 1; ++ip < itemmax; ) {
+			if (ip->i_token != COMMON)
+				continue;
+
+			// TODO: perhaps have WASCOMMON but this will suffice
+			ip->i_token = UNDECLARED;
+
+			putrelcmd(RELCMD_COMSIZE);
+			putrelsegref(SEG_ABS, ip->i_value);
+			putrelname(ip->i_string);
+		}
+
 		// In case we hit 'end' inside an included file
 		while (now_in > 0) {
 			fclose(fin[now_in]);
@@ -6075,32 +6299,62 @@ int main(int argc, char *argv[])
 			outpass = 1;
 	}
 
-	if (bopt) {
-		flushbin();
-		flushoth();
+	flushbin();
+	flushoth();
+
+	if (fbuf)
 		putc(':', fbuf);
-		if (xeq_flag) {
+
+	if (xeq_flag) {
+		if (fbuf) {
 			puthex(0, fbuf);
 			puthex(xeq >> 8, fbuf);
 			puthex(xeq, fbuf);
 			puthex(1, fbuf);
 			puthex(255-(xeq >> 8)-xeq, fbuf);
+		}
+		if (fcmd) {
 			fprintf(fcmd, "%c%c%c%c", 2, 2, xeq, xeq >> 8);
 			fflush(fcmd);
-			putcas(0x78);
-			putcas(xeq);
-			putcas(xeq >> 8);
-		} else
-			for	(i = 0; i < 10; i++)
+		}
+		putcas(0x78);
+		putcas(xeq);
+		putcas(xeq >> 8);
+		if (fmds)
+			fprintf(fmds, "pc=$%04x\ng\n", xeq);
+	}
+	else {
+		// SYSTEM cassette files must have an execution address.
+		// Without one we simply do not output .cas or .wav SYSTEM.
+
+		int i;
+		for (i = 0; i < CNT_OUTF; i++) {
+			if (*outf[i].fpp && outf[i].system) {
+				fclose(*outf[i].fpp);
+				*outf[i].fpp = NULL;
+				unlink(outf[i].filename);
+				if (outf[i].wanted)
+					fprintf(stderr, "Warning: %s not output -- no entry address (forgot \"end label\")\n", outf[i].filename);
+			}
+		}
+
+		if (fbuf) {
+			for (i = 0; i < 10; i++)
 				putc('0', fbuf);
+		}
+	}
+
+	if (fbuf) {
 		putc('\n', fbuf);
 		fflush(fbuf);
-		// "Play Cas" seems to require trailing zeros to work
-		// properly.  And we need to output at least one zero byte
-		// to flush out the final high speed bits.
-		for (i = 0; i < 6; i++)
-			putcas(0);
 	}
+
+	// "Play Cas" seems to require trailing zeros to work
+	// properly.  And we need to output at least one zero byte
+	// to flush out the final high speed bits.
+	#define CAS_PAD 6
+	for (i = 0; i < CAS_PAD; i++)
+		putcas(0);
 
 	if (relopt) {
 		struct item *ip;
@@ -6144,15 +6398,16 @@ int main(int argc, char *argv[])
 		}
 #endif
 	}
-	else if (bopt) {
+	else if (fbds) {
 		fprintf(fbds, "%04x e\n", xeq);
 	}
 
-	if (bopt) {
+	if (fcim || fams || ftap || ftcas) {
 		int low = 0;
 		int high = sizeof(memory) - 1;
 		int chk;
 		int filelen;
+		int i;
 		char leafname[] = "FILENAMEBIN";
 
 		while (low < sizeof(memory) && (memflag[low] & (MEM_INST | MEM_DATA)) == 0)
@@ -6161,62 +6416,71 @@ int main(int argc, char *argv[])
 		while (high >= 0 && (memflag[high] & (MEM_INST | MEM_DATA)) == 0)
 			high--;
 
-		if (high >= low)
+		if (high >= low && fcim)
 			fwrite(memory + low, high + 1 - low, 1, fcim);
 
-		// AMSDOS binary file output (A for Amstrad, code from zmac 1.3)
 		filelen = (high + 1) - low;
 
-		chk = 0;
-		putc(0, fams);
-		for (i = 0; i < 11; i++) {
-			putc(leafname[i], fams);
-			chk += leafname[i];
+		// AMSDOS binary file output (A for Amstrad, code from zmac 1.3)
+		if (fams) {
+			chk = 0;
+			putc(0, fams);
+			for (i = 0; i < 11; i++) {
+				putc(leafname[i], fams);
+				chk += leafname[i];
+			}
+			for (i = 0; i < 6; i++)
+				putc(0, fams);
+
+			putc(2, fams); // Unprotected binary
+			chk += 2;
+			putc(0, fams);
+			putc(0, fams);
+			putc(low & 0xff, fams);
+			chk += low & 0xff;
+			putc(low >> 8, fams);
+			chk += low >> 8;
+			putc(0, fams);
+			putc(filelen & 0xff, fams);
+			chk += filelen & 0xff;
+			putc(filelen >> 8, fams);
+			chk += filelen >> 8;
+			putc(xeq & 0xff, fams);
+			chk += xeq & 0xff;
+			putc(xeq >> 8, fams);
+			chk += xeq >> 8;
+			for (i = 28; i < 64; i++)
+				putc(0, fams);
+
+			putc(filelen & 0xff, fams);
+			chk += filelen & 0xff;
+			putc(filelen >> 8, fams);
+			chk += filelen >> 8;
+			putc(0, fams); // this would be used if filelen > 64K
+			putc(chk & 0xff, fams);
+			putc(chk >> 8, fams);
+
+			for (i = 69; i < 128; i++)
+				putc(0, fams);
+
+			if (filelen > 0)
+				fwrite(memory + low, filelen, 1, fams);
+
+			if (filelen & 0x7f)
+				putc(0x1a, fams); // CP/M EOF character
 		}
-		for (i = 0; i < 6; i++)
-			putc(0, fams);
 
-		putc(2, fams); // Unprotected binary
-		chk += 2;
-		putc(0, fams);
-		putc(0, fams);
-		putc(low & 0xff, fams);
-		chk += low & 0xff;
-		putc(low >> 8, fams);
-		chk += low >> 8;
-		putc(0, fams);
-		putc(filelen & 0xff, fams);
-		chk += filelen & 0xff;
-		putc(filelen >> 8, fams);
-		chk += filelen >> 8;
-		putc(xeq & 0xff, fams);
-		chk += xeq & 0xff;
-		putc(xeq >> 8, fams);
-		chk += xeq >> 8;
-		for (i = 28; i < 64; i++)
-			putc(0, fams);
-
-		putc(filelen & 0xff, fams);
-		chk += filelen & 0xff;
-		putc(filelen >> 8, fams);
-		chk += filelen >> 8;
-		putc(0, fams); // this would be used if filelen > 64K
-		putc(chk & 0xff, fams);
-		putc(chk >> 8, fams);
-
-		for (i = 69; i < 128; i++)
-			putc(0, fams);
-
-		if (filelen > 0)
-			fwrite(memory + low, filelen, 1, fams);
-
-		if (filelen & 0x7f)
-			putc(0x1a, fams); // CP/M EOF character
-
-		write_tap(filelen, low, memory + low);
+		if (ftap)
+			write_tap(filelen, low, memory + low);
+ 
+		if (ftcas)
+			write_250(low, high);
 	}
 
-	if (bopt) {
+	// Output .wav files noting the padding bytes to ignore.
+	writewavs(0, CAS_PAD, CAS_PAD);
+
+	if (fbds) {
 		struct item *tp;
 
 		for (tp = itemtab; tp < itemmax; tp++) {
@@ -6227,16 +6491,16 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	if (!lopt)
+	if (fout)
 		fflush(fout);
 	if (writesyms)
 		outsymtab(writesyms);
 	compactsymtab();
 	if (eopt)
 		erreport();
-	if (!lopt && !sopt)
+	if (!sopt)
 		putsymtab();
-	if (!lopt) {
+	if (fout) {
 		eject();
 		fflush(fout);
 	}
@@ -6248,7 +6512,89 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "%d errors (see listing if no diagnostics appeared here)\n", counterr());
 	if (countwarn() > 0)
 		fprintf(stderr, "%d warnings (see listing if no diagnostics appeared here)\n", countwarn());
+
+	clean_outf_temp();
+	if (counterr() > 0)
+		clean_outf();
 	exit(counterr() > 0);
+}
+
+int getoptarg(int argc, char *argv[], int i)
+{
+	i++;
+	if (i < argc)
+		return i;
+
+	usage("missing argument for %s option", argv[i - 1]);
+	return i; // not actually reached
+}
+
+void stop_all_outf()
+{
+	int i;
+	for (i = 0; i < CNT_OUTF; i++)
+		outf[i].no_open = 1;
+}
+
+void clean_outf()
+{
+	int i;
+
+	for (i = 0; i < CNT_OUTF; i++) {
+		if (*outf[i].fpp) {
+			int size = ftell(*outf[i].fpp);
+			fclose(*outf[i].fpp);
+			*outf[i].fpp = NULL;
+			// Listing file can stick around, but not if empty.
+			if (strcmp(outf[i].suffix, "lst") != 0 || size == 0)
+				unlink(outf[i].filename);
+		}
+	}
+}
+
+void clean_outf_temp()
+{
+	int i;
+	for (i = 0; i < CNT_OUTF; i++) {
+		if (*outf[i].fpp && outf[i].temp) {
+			fclose(*outf[i].fpp);
+			*outf[i].fpp = NULL;
+			unlink(outf[i].filename);
+		}
+	}
+}
+
+// Set output files to open or not using a comma-separated list of suffixes.
+// Loops over the outf[] suffix so that "wav" can be used to eliminate all
+// .wav files.
+void suffix_list(char *sfx_lst, int no_open)
+{
+	while (sfx_lst) {
+		int i;
+		char *p = strchr(sfx_lst, ',');
+		if (p)
+			*p = '\0';
+
+		// Allow prefix '.' in case user puts them in.
+		while (*sfx_lst == '.')
+			sfx_lst++;
+
+		for (i = 0; i < CNT_OUTF; i++) {
+			char *sfx;
+			for (sfx = outf[i].suffix; sfx; ) {
+				if (ci_strcmp(sfx, sfx_lst) == 0) {
+					outf[i].no_open = no_open;
+					if (!no_open)
+						outf[i].wanted = 1;
+				}
+				sfx = strchr(sfx, '.');
+				if (sfx)
+					sfx++;
+			}
+		}
+
+		sfx_lst = p ? p + 1 : 0;
+	}
 }
 
 void equate(char *id, int value)
@@ -6301,6 +6647,7 @@ void setvars()
 	JPopt = default_JPopt;
 	strcpy(modstr, "@@@@");
 	segment = SEG_CODE;
+	cur_common = NULL;
 	memset(seg_pos, 0, sizeof(seg_pos));
 	memset(seg_size, 0, sizeof(seg_size));
 	segchange = 0;
@@ -6343,6 +6690,8 @@ void setvars()
 		var[3] = '\0';
 		equate(var, mras_param[i]);
 	}
+
+	reset_import();
 }
 
 //
@@ -6374,9 +6723,12 @@ void setmem(int addr, int value, int type)
 void error(char *as)
 {
 	*linemax = 0;
-	fprintf(fout, "%s\n", linebuf);
-	fflush(fout);
+	if (fout) {
+		fprintf(fout, "%s\n", linebuf);
+		fflush(fout);
+	}
 	fprintf(stderr, "%s\n", as) ;
+	clean_outf();
 	exit(1);
 }
 
@@ -6429,7 +6781,7 @@ void putsymtab()
 	int numcol = printer_output ? 4 : 1;
 	struct item *tp;
 
-	if (!nitems)
+	if (!nitems || !fout)
 		return;
 
 	title = "**  Symbol Table  **";
@@ -6450,6 +6802,8 @@ void putsymtab()
 				c = ' ' ;
 				if (t == EQUATED || t == DEFLED)
 					c = '=' ;
+				if (t == COMMON)
+					c = '/';
 				if (tp->i_uses == 0)
 					c1 = '+' ;
 				else
@@ -6491,6 +6845,9 @@ void putsymtab()
 void erreport()
 {
 	int i, numerr, numwarn;
+
+	if (!fout)
+		return;
 
 	if (line > 49) eject();
 	lineout();
@@ -7040,14 +7397,44 @@ char *getsuffix(char *str)
 // Construct output file given input path.
 // Essentially files for "file.z" are sent to "zout/file.suffix".
 // And for "dir/file.z" they are "zout/file.suffix"
+// Creates output directory as a side effect.
 
 void outpath(char *out, char *src, char *suff)
 {
-	strcpy(out, "zout");
+	static int did_mkdir = 0;
+
+	strcpy(out, output_dir);
+
+	if (!did_mkdir) {
+		char *dir = out;
+		while (*dir) {
+			char *p;
+			int ch;
+			for (p = dir; *p && *p != '/'
+#ifdef WIN32
+				 && *p != '\\'
+#endif
+				 ; p++) { };
+			ch = *p;
+			*p = '\0';
+#ifdef WIN32
+			_mkdir(out);
+#else
+			mkdir(out, 0777);
+#endif
+			*p = ch;
+			dir = p;
+			if (ch)
+				dir++;
+		}
+		did_mkdir = 1;
+	}
+
 	if (!suff)
 		return;
 
-	strcat(out, "/");
+	if (*out)
+		strcat(out, "/");
 	strcat(out, basename(src));
 	suffix(out, suff);
 }
@@ -7233,22 +7620,26 @@ void copyname(char *st1, char *st2)
 }
 
 /* get the next source file */
-void next_source(char *sp)
+void next_source(char *sp, int always)
 {
+	char *path;
+
+	if (!always && imported(sp))
+		return;
 
 	if(now_in == NEST_IN -1)
 		error("Too many nested includes") ;
-	if ((now_file = open_incpath(sp, "r")) == NULL) {
+	if ((now_file = open_incpath(sp, "r", &path)) == NULL) {
 		char ebuf[1024] ;
 		sprintf(ebuf,"Can't open include file: %s", sp) ;
 		error(ebuf) ;
 	}
 	if (outpass && iflist()) {
 		lineout() ;
-		fprintf(fout, "**** %s ****\n",sp) ;
+		fprintf(fout, "**** %s ****\n", path) ;
 	}
 
-	if (outpass && bopt)
+	if (outpass && fbds)
 		fprintf(fbds, "%04x %04x f %s\n", dollarsign, emit_addr, sp);
 
 	/* save the list control flag with the current line number */
@@ -7265,8 +7656,7 @@ void next_source(char *sp)
 	/* start with line 0 */
 	linein[now_in] = 0 ;
 	/* save away the file name */
-	src_name[now_in] = malloc(strlen(sp)+1) ;
-	strcpy(src_name[now_in],sp) ;
+	src_name[now_in] = path;
 }
 
 int phaseaddr(int addr)
@@ -7287,7 +7677,7 @@ int phaseaddr(int addr)
 // Include contents of named file as binary data.
 void incbin(char *filename)
 {
-	FILE *fp = open_incpath(filename, "rb");
+	FILE *fp = open_incpath(filename, "rb", NULL);
 	int ch;
 	int start = dollarsign;
 	int last = start;
@@ -7301,13 +7691,13 @@ void incbin(char *filename)
 	}
 
 	addtoline('\0');
-	if (outpass && bopt)
+	if (outpass && fbds)
 		fprintf(fbds, "%04x %04x s %s", dollarsign, emit_addr, linebuf);
 
 	// Avoid emit() because it has a small buffer and it'll spam the listing.
 	bds_count = 0;
 	while ((ch = fgetc(fp)) != EOF) {
-		if (outpass && bopt) {
+		if (outpass && fbds) {
 			if (bds_count == 0)
 				fprintf(fbds, "%04x %04x d ", dollarsign, emit_addr);
 			fprintf(fbds, "%02x", ch);
@@ -7330,7 +7720,7 @@ void incbin(char *filename)
 		putrel(ch);
 		putout(ch);
 	}
-	if (outpass && bopt && bds_count)
+	if (outpass && fbds && bds_count)
 		fprintf(fbds, "\n");
 
 	fclose(fp);
@@ -7373,13 +7763,13 @@ void dc(int count, int value)
 	int bds_count;
 
 	addtoline('\0');
-	if (outpass && bopt)
+	if (outpass && fbds)
 		fprintf(fbds, "%04x %04x s %s", dollarsign, emit_addr, linebuf);
 
 	// Avoid emit() because it has a small buffer and it'll spam the listing.
 	bds_count = 0;
 	while (count-- > 0) {
-		if (outpass && bopt) {
+		if (outpass && fbds) {
 			if (bds_count == 0)
 				fprintf(fbds, "%04x %04x d ", dollarsign, emit_addr);
 			fprintf(fbds, "%02x", value);
@@ -7401,7 +7791,7 @@ void dc(int count, int value)
 		putrel(value);
 		putout(value);
 	}
-	if (outpass && bopt && bds_count)
+	if (outpass && fbds && bds_count)
 		fprintf(fbds, "\n");
 
 	// Do our own list() work as we emit bytes manually.
@@ -7496,8 +7886,11 @@ void advance_segment(int step)
 	if (top >= 0x10000)
 		top = 0xffff;
 
-	if (top > seg_size[segment])
+	if (top > seg_size[segment]) {
 		seg_size[segment] = top;
+		if (segment == SEG_COMMON && cur_common)
+			cur_common->i_value = top;
+	}
 }
 
 void expr_reloc_check(struct expr *ex)
@@ -7611,21 +8004,23 @@ struct expr *expr_mk(struct expr *left, int op, struct expr *right)
 		}
 		return ex;
 	case '/':
-		if (right->e_value == 0)
-			err[eflag]++;
-		else
-			val = left->e_value / right->e_value;
-
+		if (!(right->e_scope & SCOPE_EXTERNAL)) {
+			if (right->e_value == 0)
+				err[eflag]++;
+			else
+				val = left->e_value / right->e_value;
+		}
 		break;
 	case '*':
 		val = left->e_value * right->e_value;
 		break;
 	case '%':
-		if (right->e_value == 0)
-			err[eflag]++;
-		else
-			val = left->e_value % right->e_value;
-
+		if (!(right->e_scope & SCOPE_EXTERNAL)) {
+			if (right->e_value == 0)
+				err[eflag]++;
+			else
+				val = left->e_value % right->e_value;
+		}
 		break;
 	case '&':
 		val = left->e_value & right->e_value;
@@ -7674,6 +8069,7 @@ struct expr *expr_mk(struct expr *left, int op, struct expr *right)
 		break;
 	default:
 		fprintf(stderr, "internal expression evaluation error!\n");
+		clean_outf();
 		exit(-1);
 		break;
 	}
@@ -7932,4 +8328,253 @@ void write_tap(int len, int org, unsigned char *data)
 	write_tap_block(0xff, p - block, block);
 
 	write_tap_block(0xff, len, data);
+}
+
+#define WORD(w) (w) & 255, (w) >> 8
+
+void write_250(int low, int high)
+{
+	int load = low;
+	int len = high - low + 1;
+	int last;
+	int chk;
+
+	if (xeq_flag) {
+		// Only add relocation if they don't already put their
+		// execution address in to $41FE.  This means programs will
+		// be unchanged if they seem to be aware of the structure.
+
+		if (low > 0x41FE || high < 0x41FF ||
+			memory[0x41FE] != (xeq & 0xff) ||
+			memory[0x41FF] != xeq >> 8)
+		{
+			if (low >= 0x4200 && low <= 0x4200 + 14) {
+				// A little too high.  More efficient to
+				// just load a bit extra.  Plus we can't
+				// easily fit in the "copy up" code.
+				low = 0x41FE;
+				memory[0x41FE] = xeq;
+				memory[0x41FF] = xeq >> 8;
+				load = low;
+			}
+			else if (low < 0x4200) {
+				// Moving down.
+				int src = 0x4200;
+				int dst = low;
+				unsigned char relo[] = {
+					0x21, WORD(src),	// LD HL,nn
+					0x11, WORD(dst),	// LD DE,nn
+					0x01, WORD(len),	// LD BC,len
+					0xED, 0xB0,		// LDIR
+					0xC3, WORD(xeq)		// JP nn
+				};
+				high++;
+				low -= 2;
+				memory[low] = src + len;
+				memory[low + 1] = (src + len) >> 8;
+				memcpy(memory + high, relo, sizeof relo);
+				high += sizeof relo - 1;
+				load = 0x41FE;
+			}
+			else {
+				// Moving up
+				int src = 0x41FE + 2 + 14 + len - 1;
+				int dst = low + len - 1;
+				unsigned char relo[] = {
+					WORD(0x4200),
+					0x21, WORD(src),	// LD HL,nn
+					0x11, WORD(dst),	// LD DE,nn
+					0x01, WORD(len),	// LD BC,len
+					0xED, 0xB8,		// LDDR
+					0xC3, WORD(xeq)		// JP nn
+				};
+				low -= sizeof relo;
+				memcpy(memory + low, relo, sizeof relo);
+				load = 0x41FE;
+			}
+		}
+	}
+
+	len = high + 1 - low;
+	last = load + len;
+	// Yeah, it is big endian.
+	fprintf(ftcas, "%c%c%c%c", load >> 8, load, last >> 8, last);
+	fwrite(memory + low, len, 1, ftcas);
+	chk = 0;
+	for (i = 0; i < len; i++)
+		chk += memory[low + i];
+	fprintf(ftcas, "%c", -chk);
+}
+
+int bitgetbuf;
+int bitgetcnt;
+
+void bitget_rewind(FILE *fp)
+{
+	bitgetcnt = 0;
+	fseek(fp, 0, SEEK_SET);
+}
+
+int bitget(FILE *fp)
+{
+	int bit;
+
+	if (bitgetcnt == 0) {
+		bitgetbuf = fgetc(fp);
+		bitgetcnt = 8;
+	}
+
+	bit = !!(bitgetbuf & 0x80);
+	bitgetbuf <<= 1;
+	bitgetcnt--;
+
+	return bit;
+}
+
+void writewavs(int pad250, int pad500, int pad1500)
+{
+	FILE *cas[] = { ftcas, flcas, flnwcas, fcas };
+	FILE *wav[] = { f250wav, f500wav, f1000wav, f1500wav };
+	int padbytes[] = { pad250, pad500, pad500, pad1500 };
+#define	NFMT (sizeof padbytes / sizeof padbytes[0])
+	int bits[NFMT];
+	int i, j, k, m;
+	unsigned char pulse[][2][13] = {
+		{ { 2, 0xff, 2, 0, 42 - 4, 0x80, 0 },
+		  { 2, 0xff, 2, 0, 17, 0x80, 2, 0xff, 2, 0, 17, 0x80, 0 } },
+
+		{ { 3, 0xff, 3, 0, 44 - 6, 0x80, 0 },
+		  { 3, 0xff, 3, 0, 16, 0x80, 3, 0xff, 3, 0, 16, 0x80, 0 } },
+
+		{ { 3, 0xff, 3, 0, 44 - 6, 0x80, 0 },
+		  { 3, 0xff, 3, 0, 16, 0x80, 3, 0xff, 3, 0, 16, 0x80, 0 } },
+
+		{ { 8, 0, 8, 0xff, 0 },
+		  { 4, 0, 4, 0xff, 0 } }
+	};
+	int hz[] = { 11025, 22050, 44100, 22050 };
+	int pulse_len[NFMT][2];
+
+	for (i = 0; i < NFMT; i++) {
+		for (j = 0; j < 2; j++) {
+			pulse_len[i][j] = 0;
+			for (k = 0; pulse[i][j][k]; k += 2)
+				pulse_len[i][j] += pulse[i][j][k];
+		}
+	}
+
+	for (i = 0; i < NFMT; i++) {
+		if (!cas[i] || !wav[i])
+			continue;
+
+		bits[i] = (ftell(cas[i]) - padbytes[i]) * 8;
+		if (i == 2 && casbitcnt > 0)
+			bits[i] -= 8 - casbitcnt;
+	}
+
+	for (i = 0; i < NFMT; i++) {
+		int headPad = 10, tailPad = hz[i] / 2;
+		int audio_bytes = headPad;
+		unsigned char hzlo = hz[i] & 0xff;
+		unsigned char hzhi = hz[i] >> 8;
+
+		unsigned char waveHeader[] = {
+			'R', 'I', 'F', 'F',
+			0, 0, 0, 0,
+			'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
+			16, 0, 0, 0, // wav information length
+			1, 0, // PCM
+			1, 0, // Single channel
+			hzlo, hzhi, 0, 0, // samples/second
+			hzlo, hzhi, 0, 0, // average bytes/second
+			1, 0, // block alignment
+			8, 0, // bits/sample
+			'd', 'a', 't', 'a',
+			0, 0, 0, 0
+		};
+		int waveHeaderSize = sizeof waveHeader;
+
+		if (!cas[i] || !wav[i])
+			continue;
+
+		bitget_rewind(cas[i]);
+		for (j = 0; j < bits[i]; j++)
+			audio_bytes += pulse_len[i][bitget(cas[i])];
+
+		audio_bytes += tailPad;
+
+		waveHeader[waveHeaderSize - 4] = audio_bytes;
+		waveHeader[waveHeaderSize - 3] = audio_bytes >> 8;
+		waveHeader[waveHeaderSize - 2] = audio_bytes >> 16;
+		waveHeader[waveHeaderSize - 1] = audio_bytes >> 24;
+
+		waveHeader[4] = (audio_bytes + 36);
+		waveHeader[5] = (audio_bytes + 36) >> 8;
+		waveHeader[6] = (audio_bytes + 36) >> 16;
+		waveHeader[7] = (audio_bytes + 36) >> 24;
+
+		bitget_rewind(cas[i]);
+
+		fwrite(waveHeader, waveHeaderSize, 1, wav[i]);
+
+		for (j = 0; j < headPad; j++)
+			fputc(0x80, wav[i]);
+
+		bitget_rewind(cas[i]);
+		for (j = 0; j < bits[i]; j++) {
+			int bit = bitget(cas[i]);
+			for (k = 0; pulse[i][bit][k]; k += 2)
+				for (m = 0; m < pulse[i][bit][k]; m++)
+					fputc(pulse[i][bit][k + 1], wav[i]);
+		}
+
+		for (j = 0; j < tailPad; j++)
+			fputc(0x80, wav[i]);
+	}
+}
+
+// Tracking whether a file has been imported.
+
+struct import_list {
+	struct import_list *next;
+	char *filename;
+	int imported;
+} *imports;
+
+void reset_import()
+{
+	struct import_list *il;
+	for (il = imports; il; il = il->next)
+		il->imported = 0;
+}
+
+// Returns 1 if filename has been imported.  Marks it as imported.
+// Only uses the base name.
+
+int imported(char *filename)
+{
+	struct import_list *il;
+	int ret;
+	char *p;
+
+	for (p = filename; *p; p++)
+		if (*p == '/' || *p == '\\')
+			filename = p + 1;
+
+	for (il = imports; il; il = il->next) {
+		if (strcmp(filename, il->filename) == 0)
+			break;
+	}
+
+	if (!il) {
+		il = malloc(sizeof *il);
+		il->filename = strdup(filename);
+		il->imported = 0;
+		il->next = imports;
+		imports = il;
+	}
+
+	ret = il->imported;
+	il->imported = 1;
+	return ret;
 }

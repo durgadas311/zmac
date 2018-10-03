@@ -1,3 +1,4 @@
+
 #define	NAMELEN		8
 #define	MAX_SEGMENTS	128
 #define MAX_COMMONS	(MAX_SEGMENTS-3)
@@ -12,6 +13,7 @@
 #define	F_IHEX		0	/* Intel HEX */
 #define	F_BIN00		1	/* binary, gaps filled with 00 */
 #define	F_BINFF		2	/* binary, gaps filled with FF */
+#define F_CMD		3	/* TRS-80 CMD file format */
 
 /* segment types */
 #define	T_ABSOLUTE	0x00
@@ -48,7 +50,7 @@ struct object_item {
 			int A_t;
 			unsigned short A_value;
 			int B_len;
-			char B_name[NAMELEN+1];
+			unsigned char B_name[NAMELEN+1];
 		} special;
 	} v;
 };
@@ -126,6 +128,10 @@ extern unsigned char usage_map[];
 #define MARKED32(a)	(((long*)usage_map)[(a)/32] == 0xffffffff)
 #define UNMARKED32(a)	(((long*)usage_map)[(a)/32] == 0)
 
+#ifdef WINHACK
+#define __attribute__(x)
+#endif
+
 void die(int, const char*, ...) __attribute__ ((__noreturn__));
 void *calloc_or_die(size_t, size_t);
 
@@ -156,4 +162,32 @@ void convert_chain_to_nodes(char *, int, struct section *);
 void process_nodes(void);
 struct node *add_node(struct section *, int, int);
 
-int do_out(FILE *, int);
+int do_out(FILE *, int, int);
+
+extern int optget_ind;
+extern int optget(int argc, char **argv, char *options, char **arg);
+
+#ifdef NEED_HSEARCH
+
+typedef struct {
+	char *key;
+	void *data;
+} ENTRY;
+
+typedef enum { ENTER, FIND } ACTION;
+
+extern int hcreate(size_t);
+extern ENTRY *hsearch(ENTRY item, ACTION action);
+extern void hdestroy();
+
+#endif
+
+#ifdef WINHACK
+
+// These #defines remove some compiler complaints in VS2008 Express.
+// It is possible they otherwise break compilation.
+
+#define strdup _strdup
+#define unlink _unlink
+
+#endif

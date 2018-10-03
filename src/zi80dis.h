@@ -60,6 +60,21 @@ public:
 	ArgType m_argType[2];	// type of argument
 	bool m_neverNext;		// processor never proceeds to the following instruction
 	int m_stableMask;		// bit set for each byte of instruction invariant to relocation
+	int m_attrMask;			// bit set indicating read/write/byte/word/in/out/jp/jr/jp(rr) (see AttrBit)
+
+	enum AttrBit {
+		attrRead = 1,
+		attrWrite = 2,
+		attrByte = 4,
+		attrWord = 8,
+		attrIn = 16,
+		attrOut = 32,
+		attrJump = 64,
+		attrBranch = 128,
+		attrCall = 256,
+		attrRst = 512,
+		attrJumpReg = 1024
+	};
 
 	// Options.
 

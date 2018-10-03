@@ -137,13 +137,13 @@ void add_item(struct object_item *item, char *filename)
 			t++;
 			/* FALL THROUGH */
 		case C_PROG_SIZE:	/* 13 */
-			add_section(t, BNAME, base_address(t,BNAME),
+			add_section(t, (char *)BNAME, base_address(t,(char *)BNAME),
 				AVALUE, filename);
-			if (uncommon(t,BNAME)) {
-				base = base_address(current_section_t, BNAME);
+			if (uncommon(t,(char *)BNAME)) {
+				base = base_address(current_section_t, (char *)BNAME);
 				if (base >= 0)
 					set_base_address(current_section_t,
-						BNAME, base + AVALUE, 0);
+						(char *)BNAME, base + AVALUE, 0);
 			}
 			break;
 		case C_SET_LC:		/* 11 */
@@ -154,14 +154,14 @@ void add_item(struct object_item *item, char *filename)
 			overlap=0;
 			break;
 		case C_SELECT_COMMON:	/* 1 */
-			sp = search_segment(T_COMMON, BNAME, A_FIND);
+			sp = search_segment(T_COMMON, (char *)BNAME, A_FIND);
 			if (sp==NULL || sp->secs==NULL) die(E_INPUT,
 				"ld80: No common segment %s\n", BNAME);
 			for (p=sp->secs; p->next; p=p->next) /* EMPTY */;
 			secs[T_COMMON] = p;
 			break;
 		case C_EXTENSION:	/* 4 */
-			b = (unsigned char *)BNAME;
+			b = BNAME;
 			switch (b[0]) {
 			case 'A':	/* operator */
 				add_node(secs[current_section_t],
@@ -173,7 +173,7 @@ void add_item(struct object_item *item, char *filename)
 					secs[current_section_t]->lc,
 					N_EXTERNAL);
 				n->symbol =
-					find_symbol(BNAME+1);
+					find_symbol((char *)BNAME+1);
 				break;
 			case 'C':	/* base+offset operand */
 				n = add_node(secs[current_section_t],
@@ -205,11 +205,11 @@ void add_item(struct object_item *item, char *filename)
 		/********************** tail *************************/
 		case C_CHAIN_EXTERNAL:	/* 6 */
 			if (to_chain(item, filename))
-				convert_chain_to_nodes(BNAME, AVALUE,
+				convert_chain_to_nodes((char *)BNAME, AVALUE,
 					secs[ATYPE]);
 			break;
 		case C_ENTRY_POINT:	/* 7 */
-			add_symbol(BNAME, AVALUE, secs[ATYPE]);
+			add_symbol((char *)BNAME, AVALUE, secs[ATYPE]);
 			break;
 		case C_CHAIN_ADDRESS:	/* 12 */
 			die(E_INPUT, "ld80: Address chain is unimplemented."
@@ -222,7 +222,7 @@ void add_item(struct object_item *item, char *filename)
 					/* NEVER CALLED */
 			break;
 		case C_PROGNAME:	/* 2 */
-			strncpy(module_name,BNAME,NAMELEN);
+			strncpy(module_name,(char *)BNAME,NAMELEN);
 			add_section(T_ABSOLUTE,NULL,0x0000,0x10000,filename);
 			break;
 		}
@@ -342,9 +342,10 @@ void dump_sections(void)
 
 	printf("\nSection dump:\n");
 	for (segp=segv; segp<=segv+T_COMMON || segp->secs; segp++) {
+		char *sname = segp->type >= 0 && segp->type < 4 ? segname[segp->type] : "<unused>";
 		printf("seg=%p type=%d(%s) name=/%s/ %s def.base=%.4x "
 			"max.size=%.4x\n",
-			segp, segp->type, segname[segp->type],
+			segp, segp->type, sname,
 			segp->common_name, segp->uncommon ? "concatenated" :
 			"overlapped", segp->default_base, segp->maxsize);
 		for (sp=segp->secs; sp; sp=sp->next) {

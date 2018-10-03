@@ -1,4 +1,7 @@
+#ifndef NEED_HSEARCH
 #include <search.h>
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +25,7 @@ struct symbol *find_symbol(char *name)
 	strcpy(sym->name, name);
 	sym->value = UNDEFINED;
 
-	e.key = sym->name;
+	e.key = strdup(sym->name);
 	e.data = (char *)sym;
 	ep = hsearch(e, ENTER);
 	if (ep == NULL) die(E_RESOURCE, "ld80: Not enough memory\n");
@@ -88,7 +91,7 @@ void dump_symbols(void)
 	int i;
 
 	for (i=0; i<next_symbol; i++) {
-		printf("name=%-8s section=%p offset=%.4hx value=%.4hx\n",
+		printf("name=%-8s section=%p offset=%.4x value=%.4x\n",
 			symbol_table[i].name, symbol_table[i].at.section,
 			symbol_table[i].at.offset, symbol_table[i].value);
 	}
@@ -97,11 +100,13 @@ void dump_symbols(void)
 
 #define	SYM(x)	(*((struct symbol **)(x)))
 
+/*
 static
 int by_value(const void *a, const void *b)
 {
 	return SYM(a)->value - SYM(b)->value;
 }
+*/
 
 static
 int by_name(const void *a, const void *b)
@@ -124,7 +129,7 @@ void print_symbol_table(FILE *f)
 
 	for (i=0,sp=slist; i<next_symbol; i++, sp++) {
 		s = *sp;
-		if (s->at.section) fprintf(f,"%-8s %.4hx  %-8s %s\n",
+		if (s->at.section) fprintf(f,"%-8s %.4x  %-8s %s\n",
 				s->name, s->value, s->at.section->module_name,
 				s->at.section->filename);
 		else fprintf(f,"%-8s *** UNDEFINED ***\n", s->name);

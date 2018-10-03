@@ -1,15 +1,15 @@
-VERSION = 0.4b
+VERSION = 0.5
 CFLAGS = -g -Wall -Wstrict-prototypes -DVERSION=\"$(VERSION)\"
 CFLAGS := $(CFLAGS) -DDEBUG
 
 .SUFFIXES: .pod .1 .html .ps
 
-OBJS = main.o readobj.o section.o symbol.o fixup.o do_out.o
+OBJS = main.o readobj.o section.o symbol.o fixup.o do_out.o optget.o
 MANPAGES = ld80.1
 PSFILES = ld80.ps
 
 ld80:		$(OBJS)
-		gcc -o ld80 $(OBJS)
+		gcc -g -o ld80 $(OBJS)
 
 main.o:		ld80.h
 
@@ -22,6 +22,8 @@ fixup.o:	ld80.h
 symbol.o:	ld80.h
 
 do_out.o:	ld80.h
+
+optget.o:	ld80.h
 
 clean:
 		rm -f *.o pod2html-*cache

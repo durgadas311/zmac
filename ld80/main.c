@@ -1,7 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
+#ifndef WINHACK
 #include <unistd.h>
-#include <getopt.h>
+#endif
 #include <string.h>
 #include <stdarg.h>
 #include <errno.h>
@@ -13,21 +14,26 @@ static char *ofilename, *symfilename;
 int fatalerror;
 
 void usage(void);
+int setformat(char *name, int *format);
 
 int main(int argc,char **argv)
 {
-	unsigned n;
+	int n;
 	int c, type, align;
 	int suppress_data = 0;
 	int oformat = F_IHEX;
 	FILE *ofile, *symfile=NULL;
-	int symsize = 1024;
+	int symsize = 32768;
+	int entry_point = -1;
+	char *entry_name = NULL;
 	int argc2 = 1;
 	char **argv2;
 	int abort = 0;
 	int lib = 0;
 	int symbol_table_required = 0, map_required = 0;
-	char *common_name;
+	char *common_name = "COMMON";
+	char *optarg;
+	char *tmp;
 
 	init_section();
 
@@ -40,14 +46,14 @@ int main(int argc,char **argv)
 	argv2 = calloc_or_die(argc*2+1, sizeof(*argv2));
 	argc2=1;
 
-#define	REGULAR_OPTSTRING	"-VlP:D:C:U:O:o:hcs:mS:W:"
+#define	REGULAR_OPTSTRING	"VlP:D:C:U:E:O:o:hcs:mS:W:"
 #ifdef	DEBUG
 #define	OPTSTRING		REGULAR_OPTSTRING "d"
 #else
 #define	OPTSTRING		REGULAR_OPTSTRING
 #endif
 
-	while ((c = getopt (argc, argv, OPTSTRING)) != -1) switch (c) {
+	while ((c = optget (argc, argv, OPTSTRING, &optarg)) != -1) switch (c) {
 	case 1:		/* Input file */
 		argv2[argc2++] = optarg;	/* defer processing */
 		break;
@@ -83,12 +89,12 @@ int main(int argc,char **argv)
 		break;
 	case 'o':	/* Output file */
 		ofilename = optarg;
+		tmp = strrchr(optarg, '.');
+		if (tmp)
+			setformat(tmp + 1, &oformat);
 		break;
 	case 'O':	/* Output format */
-		if (!strcmp(optarg,"ihex")) oformat = F_IHEX;
-		else if (!strcmp(optarg,"bin")) oformat = F_BIN00;
-		else if (strcmp(optarg,"binff")) oformat = F_BINFF;
-		else {
+		if (!setformat(optarg, &oformat)) {
 			usage();
 			abort = 1;
 		}
@@ -101,6 +107,17 @@ int main(int argc,char **argv)
 		else {
 			usage();
 			abort = 1;
+		}
+		break;
+	case 'E':	/* Entry Point */
+		if (optarg[0] >= '0' && optarg[0] <= '9') {
+			entry_point = strtoul(optarg, NULL, 16);
+			if (entry_point < 0 || entry_point > 0xffff) {
+				die(E_USAGE,"ld80: Address %x is out of range\n", entry_point);
+			}
+		}
+		else {
+			entry_name = optarg;
 		}
 		break;
 	case 's':	/* Symbol table */
@@ -145,8 +162,8 @@ int main(int argc,char **argv)
 	 */
 	init_symbol(symsize);
 
-	optind = 0;	/* make reinitialize getopt() */
-	while ((c = getopt (argc2, argv2, "-lD:P:C:")) != -1) switch (c) {
+	optget_ind = 0;	/* make reinitialize optget() */
+	while ((c = optget (argc2, argv2, "lD:P:C:", &optarg)) != -1) switch (c) {
 	case 'l':	/* Library to search in */
 		lib = 1;
 		break;
@@ -217,17 +234,43 @@ int main(int argc,char **argv)
 	if (symbol_table_required) print_symbol_table(symfile);
 
 	if (ofilename) {
-		if ((ofile=fopen(ofilename,"w")) == NULL) die(E_USAGE,
+		char *write_mode = oformat == F_IHEX ? "w" : "wb";
+		if ((ofile=fopen(ofilename,write_mode)) == NULL) die(E_USAGE,
 			"ld80: Cannot open output file %s: %s\n",
 			ofilename, sys_errlist[errno]);
 	}
 	else die(E_USAGE, "ld80: No output file specified\n");
 
-	do_out(ofile, oformat);
+	if (entry_name) {
+		struct symbol *entry;
+		char *s;
+		for (s=entry_name; *s; s++) *s = toupper(*s);
+		entry = find_symbol(entry_name);
+		if (!entry || entry->value == UNDEFINED)
+			die(E_USAGE,"ld80: Entry point '%s' not found.\n", entry_name);
+
+		entry_point = entry->value;
+	}
+
+	do_out(ofile, oformat, entry_point);
 	fclose(ofile);
 
 	clear_symbol();
 	die(fatalerror ? E_INPUT : E_SUCCESS, "");
+}
+
+int setformat(char *name, int *format)
+{
+	int known = 1;
+
+	if (!strcmp(name, "ihex")) *format = F_IHEX;
+	else if (!strcmp(name, "hex")) *format = F_IHEX;
+	else if (!strcmp(name, "bin")) *format = F_BIN00;
+	else if (!strcmp(name, "binff")) *format = F_BINFF;
+	else if (!strcmp(name, "cmd")) *format = F_CMD;
+	else known = 0;
+
+	return known;
 }
 
 void *calloc_or_die(size_t nmemb, size_t size)
@@ -243,9 +286,9 @@ void usage(void)
 "Usage:\n"
 "ld80 [-O oformat] [-cmV] [-W warns] -o ofile [-s symfile] [-U name] ...\n"
 "     [-S symsize] input ...\n"
-"where oformat: ihex | bin | binff\n"
+"where oformat: ihex | hex | bin | binff | cmd\n"
 "        warns: extchain\n"
-"        input: [-l] [-P address] [-D address] [-C name,address] ... file\n"
+"        input: [-l] [-P address] [-D address] [-C name,address] [-E entry]... file\n"
 	);
 }
 
@@ -255,7 +298,7 @@ void die(int status, const char *format, ...)
 
 	fflush(stdout);
 	va_start(arg, format);
-	fprintf(stderr, format, arg);
+	vfprintf(stderr, format, arg);
 	va_end(arg);
 
 	if (status && ofilename) unlink(ofilename);
