@@ -98,9 +98,7 @@ zmac
   Don't generate any machine code output at all.
  
  -c
-  Make the listing continuous, i.e., don't generate any page breaks or
-  page headers. Can make things less confusing if you're going to
-  consult the listing online rather than printing it.  This is the default.
+  Don't display cycle counts in the listing.
  
  -e
   Omit the "error report" section in the listing.
@@ -194,7 +192,7 @@ expression@expr can be used in their place.
 ..Data
 
 _defb 42_
-|A byte.  _ascii_, _byte_, _db_, _defm_ and _text_ are synonyms.
+|A byte.  _ascii_, _byte_, _db_, _defm_, _dm_ and _text_ are synonyms.
 
 _defb 'foobar'_
 |An ASCII character string (not NUL-terminated).

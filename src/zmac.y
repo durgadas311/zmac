@@ -1,6 +1,6 @@
 %{
 // GWP - keep track of version via hand-maintained date stamp.
-#define VERSION "28jul2018"
+#define VERSION "5dec2018"
 
 /*
  *  zmac -- macro cross-assembler for the Zilog Z80 microprocessor
@@ -177,6 +177,13 @@
  *
  * gwp 28-7-18	Double free of output files bug fix from Pedro Gimeno.  Don't
  *		output SYSTEM files if no entry point thanks to Tim Halloran.
+ *
+ * gwp 6-10-18	Stop quoted inclued file crash on for OSX (and linux?). Thanks
+ *		to Paulo Silva. Added "dm" as "ascii" alias for Blair Robins.
+ *
+ * gwp 5-12-18	Peter Wilson ran into quoted include crash.  Also suggested
+ *		import be allowed in column 0 and noted that keywords like
+ *		IF and LIST could not be labels even if given colons.
  */
 
 #if defined(__GNUC__)
@@ -4191,6 +4198,7 @@ struct	item	keytab[] = {
 	{".dephase",	0,	DEPHASE,	VERB },
 	{"di",		0363,	NOOPERAND,	VERB | I8080 | Z80 },
 	{"djnz",	020,	DJNZ,		VERB | Z80 },
+	{".dm",		0,	DEFB,		VERB },
 	{".ds",		0,	DEFS,		VERB },
 	{"dsbc",	0xed42,	ARITH16,	VERB | Z80 | ZNONSTD },
 	{".dseg",	SEG_DATA,SETSEG,	VERB },
@@ -4237,7 +4245,7 @@ struct	item	keytab[] = {
 	{"im0",		0xed46,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"im1",		0xed56,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"im2",		0xed5e,	NOOPERAND,	VERB | Z80 | ZNONSTD },
-	{".import",	PSIMPORT,ARGPSEUDO,	VERB },
+	{".import",	PSIMPORT,ARGPSEUDO,	VERB | COL0 },
 	{"in",		0333,	TK_IN,		VERB | I8080 | Z80 },
 	{"inc",		0,	INCDEC,		VERB | Z80 },
 	{".incbin", 	0, 	INCBIN,		VERB },
@@ -4759,13 +4767,13 @@ int lex()
 			exclude = VERB;
 			include = TERM;
 		}
+		else if (logcol <= 1 && c == ':') {
+			exclude = ~TERM;
+			logcol = 0;
+		}
 		else if (logcol == 0 && c != ';' && c != '\n') {
 			exclude = ~TERM;
 			include = COL0;
-		}
-		else if (logcol == 1 && c == ':') {
-			exclude = ~TERM;
-			logcol = 0;
 		}
 
 		logcol++;
@@ -5730,9 +5738,12 @@ FILE *open_incpath(char *filename, char *mode, char **path_used)
 
 	quote = *filename;
 	if (quote == '"' || quote == '\'') {
-		strcpy(filename, filename + 1);
-		if (strrchr(filename, quote))
-			*strrchr(filename, quote) = '\0';
+		char *p;
+		for (p = filename; *p; p++)
+			p[0] = p[1];
+
+		if (p[-2] == quote)
+			p[-2] = '\0';
 	}
 
 	// First look for included file in same directory as source file.
@@ -8338,6 +8349,21 @@ void write_250(int low, int high)
 	int len = high - low + 1;
 	int last;
 	int chk;
+
+	if (len <= 0) {
+		// Nothing to output.  So we'll just delete the output file.
+		int i;
+		for (i = 0; i < CNT_OUTF; i++) {
+			if (*outf[i].fpp == ftcas || *outf[i].fpp == f250wav) {
+				fclose(*outf[i].fpp);
+				*outf[i].fpp = NULL;
+				unlink(outf[i].filename);
+				if (outf[i].wanted)
+					fprintf(stderr, "Warning: %s not output -- no code or data\n", outf[i].filename);
+			}
+		}
+		return;
+	}
 
 	if (xeq_flag) {
 		// Only add relocation if they don't already put their
