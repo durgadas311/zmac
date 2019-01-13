@@ -172,6 +172,26 @@ void doc(void)
 	if (tt)
 		printf("</TT>\n");
 
+	printf("<p xmlns:dct=\"http://purl.org/dc/terms/\" xmlns:vcard=\"http://www.w3.org/2001/vcard-rdf/3.0#\">\n");
+	printf("  <a rel=\"license\"\n");
+	printf("     href=\"http://creativecommons.org/publicdomain/zero/1.0/\">\n");
+	printf("    <img src=\"http://i.creativecommons.org/p/zero/1.0/88x31.png\" style=\"border-style: none;\" alt=\"CC0\" />\n");
+	printf("  </a>\n");
+	printf("  <br />\n");
+	printf("  To the extent possible under law,\n");
+	printf("  <a rel=\"dct:publisher\"\n");
+	printf("     href=\"http://48k.ca/zmac.html\">\n");
+	printf("    <span property=\"dct:title\">George Phillips</span></a>\n");
+	printf("  has waived all copyright and related or neighboring rights to\n");
+	printf("  <span property=\"dct:title\">zmac macro cross assembler for the Zilog Z-80 microprocessor</span>.\n");
+	printf("This work is published from:\n");
+	printf("<span property=\"vcard:Country\" datatype=\"dct:ISO3166\"\n");
+	printf("      content=\"CA\" about=\"http://48k.ca/zmac.html\">\n");
+	printf("  Canada</span>.\n");
+	printf("</p>\n");
+
+	printf("\n");
+
 	printf("<!--\n");
 	printf("  If you ran \"zmac --doc\" you may want to send the output\n");
 	printf("  to a file using \"zmac --doc >zmac.html\" and then open\n");
