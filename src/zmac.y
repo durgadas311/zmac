@@ -1,6 +1,6 @@
 %{
 // GWP - keep track of version via hand-maintained date stamp.
-#define VERSION "5jan2019"
+#define VERSION "20jan2019"
 
 /*
  *  zmac -- macro cross-assembler for the Zilog Z80 microprocessor
@@ -192,6 +192,23 @@
  *		promotion isn't needed as long as shortest code is tried first.
  *
  * gwp 5-1-19	Add cycle count and output bytes to macro invocations.
+ *		[ with listing bug fixes added slightly later ]
+ *
+ * gwp 19-1-19	DRI compatibility enhancements and other bug fixes from
+ *		Douglas Miller. TWOCHAR constants ('XY') usable everywhere.
+ *		dolopt moved into function to stop LEX stack crash.  Support
+ *		labels on cseg/dseg.  Relax paren parsing for LXI instruction.
+ *		Recognize TITLE in column 0.  Stop "Not relocatable error" on
+ *		"ORG 0".  -i option stops all macro line listing.
+ *		--dri mode:
+ *		silences warnings about builtin redefinition (for Z80.LIB).
+ *		Strips '$' from constants and symbols.
+ *		Accepts '*' in column 0 as comment.
+ *		All 8080 opcodes can be use in DB and expressions.
+ *		Add recognition of DRI $-MACRO directives
+ *
+ * gwp 20-1-19	Z-80 mnemonics usable as values.  --nmnv turns that off.  def3
+ *		Register aliases.  Multiple statements per line roughed in.
  */
 
 #if defined(__GNUC__)
@@ -300,7 +317,10 @@ struct	item	{
 };
 
 void itemcpy(struct item *dst, struct item *src);
+int item_is_verb(struct item *i);
+int item_value(struct item *i);
 struct item *keyword(char *name);
+int keyword_index(struct item *k);
 
 #define SCOPE_NONE	(0)
 #define SCOPE_PROGRAM	(1)
@@ -311,6 +331,8 @@ struct item *keyword(char *name);
 #define SCOPE_NORELOC	(16)
 #define SCOPE_BUILTIN	(32)	/* abuse */
 #define SCOPE_COMBLOCK	(64)
+#define SCOPE_TWOCHAR	(128)
+#define SCOPE_ALIAS	(256)
 
 #define SCOPE_SEGMASK	(3)
 #define SCOPE_SEG(s)	((s) & SCOPE_SEGMASK)
@@ -401,8 +423,13 @@ int	trueval = 1;	// Value returned for boolean true
 int	zcompat;	// Original zmac compatibility mode
 char	modstr[8];	// Replacement string for '?' in labels when MRAS compatible
 int	relopt;		// Only output .rel files and length of external symbols
+int	driopt;		// DRI assemblers compatibility
+int	macopt;		// DRI assemblers $-MACRO et al.
+int	comnt;		// DRI assemblers '*' comment line
+int	nmnvopt;	// Mnemonics are not treated as predefined values.
 char	progname[8];	// Program name for .rel output
 int	note_depend;	// Print names of files included
+int	separator;	// Character that separates multiple statements.
 int	firstcol;
 int	logcol;
 int	coloncnt;
@@ -502,11 +529,12 @@ char	hexadec[] = "0123456789ABCDEF" ;
 
 
 int	nitems;
-int	linecnt;
 int	nbytes;
 int	invented;
 int	npass;
 int	njrpromo;
+int	multiline;
+int	prev_multiline;
 
 
 char	tempbuf[TEMPBUFSIZE];
@@ -590,7 +618,7 @@ char	copt = 1,	/* cycle counts in listings by default */
 	sopt = 0,	/* turn on symbol table listing */
 	topt = 1,	/* terse, only error count to terminal */
 	printer_output = 0, // GWP - printer style output
-	z80,
+	z80 = 1,
 	saveopt;
 
 char default_jopt, default_JPopt, default_z80 = 1;
@@ -730,6 +758,7 @@ void write_250(int low, int high);
 void writewavs(int pad250, int pad500, int pad1500);
 void reset_import();
 int imported(char *filename);
+int sized_byteswap(int value);
 
 #define RELCMD_PUBLIC	(0)
 #define RELCMD_COMMON	(1)
@@ -1387,15 +1416,25 @@ void flushrel(void)
 		fflush(frel);
 }
 
+void list_cap_line()
+{
+	if (multiline) {
+		if (lineptr > linebuf)
+			lineptr[-1] = separator;
+		addtoline('\n');
+	}
+	addtoline('\0');
+
+	prev_multiline = multiline;
+	multiline = 0;
+}
+
 /*
  *  put out a line of output -- also put out binary
  */
 void list(int optarg)
 {
-
-	if (!expptr)
-		linecnt++;
-	addtoline('\0');
+	list_cap_line();
 
 	list_out(optarg, linebuf, ' ');
 
@@ -1415,7 +1454,7 @@ void delayed_list(int optarg)
 
 void list_optarg(int optarg, int seg, int type)
 {
-	if (seg < 0)
+	if (seg < 0 || !relopt)
 		seg = relopt ? segment : SEG_ABS;
 
 	puthex(optarg >> 8, fout);
@@ -1654,7 +1693,6 @@ void errwarn(int errnum, char *message)
 	strcpy(errdetail[errnum], message);
 }
 
-
 /*
  *  list without address -- for comments and if skipped lines
  */
@@ -1662,9 +1700,8 @@ void list1()
 {
 	int lst;
 
-	addtoline('\0');
+	list_cap_line();
 	lineptr = linebuf;
-	if (!expptr) linecnt++;
 	if (outpass) {
 		if ((lst = iflist())) {
 			lineout();
@@ -1714,8 +1751,12 @@ int iflist()
 	if (!lstoff && !expptr)
 		return(1);
 	problem = countwarn() + counterr();
-	if (expptr)
-		return(mopt || problem);
+	if (expptr) {
+		if (problem) return(1);
+		if (!mopt) return(0);
+		if (mopt == 1) return(1);
+		return(emitptr > emitbuf);
+	}
 	if (eopt && problem)
 		return(1);
 	return(0);
@@ -1812,6 +1853,7 @@ void do_defl(struct item *sym, struct expr *val, int call_list);
 %token DEFD
 %token DEFS
 %token DEFW
+%token DEF3
 %token EQU
 %token DEFL
 %token <itemptr> LABEL
@@ -1868,12 +1910,13 @@ void do_defl(struct item *sym, struct expr *val, int call_list);
 %type <itemptr> label.part symbol
 %type <ival> allreg reg evenreg ixylhreg realreg mem memxy pushable bcdesp bcdehlsp mar condition
 %type <ival> spcondition
-%type <exprptr> noparenexpr parenexpr expression lxexpression
+%type <exprptr> noparenexpr parenexpr expression
 %type <ival> maybecolon maybeocto
 %type <ival> evenreg8 reg8 m pushable8
 // Types for improved macro support
 %type <cval> locals
 %type <ival> varop
+%type <itemptr> aliasable
 
 %right '?' ':'
 %left OROR
@@ -2042,6 +2085,51 @@ void common_block(char *unparsed_id)
 
 int at_least_once; // global to avoid repetition in macro repeat count processing
 
+void dolopt(struct item *itm, int enable)
+{
+	if (outpass) {
+		lineptr = linebuf;
+		switch (itm->i_value) {
+		case 0:	/* list */
+			if (enable < 0) lstoff = 1;
+			if (enable > 0) lstoff = 0;
+			break;
+
+		case 1:	/* eject */
+			if (enable) eject();
+			break;
+
+		case 2:	/* space */
+			if ((line + enable) > 60) eject();
+			else space(enable);
+			break;
+
+		case 3:	/* elist */
+			eopt = edef;
+			if (enable < 0) eopt = 0;
+			if (enable > 0) eopt = 1;
+			break;
+
+		case 4:	/* fopt */
+			fopt = fdef;
+			if (enable < 0) fopt = 0;
+			if (enable > 0) fopt = 1;
+			break;
+
+		case 5:	/* gopt */
+			gopt = gdef;
+			if (enable < 0) gopt = 1;
+			if (enable > 0) gopt = 0;
+			break;
+
+		case 6: /* mopt */
+			mopt = mdef;
+			if (enable < 0) mopt = 0;
+			if (enable > 0) mopt = 1;
+		}
+	}
+}
+
 %}
 
 %%
@@ -2077,6 +2165,13 @@ statement:
 |
 	symbol maybecolon EQU expression '\n' {
 		do_equ($1, $4, 1);
+		if ($2 == 2)
+			$1->i_scope |= SCOPE_PUBLIC;
+	}
+|
+	symbol maybecolon EQU aliasable '\n' {
+		do_equ($1, expr_num(keyword_index($4)), 1);
+		$1->i_scope |= SCOPE_ALIAS;
 		if ($2 == 2)
 			$1->i_scope |= SCOPE_PUBLIC;
 	}
@@ -2366,12 +2461,10 @@ statement:
 	}
 |
 	LIST '\n' {
-		goto dolopt; }
+		dolopt($1, 1); }
 |
 	LIST mras_undecl_on expression mras_undecl_off '\n' {
 		int enable = $3->e_value;
-
-		enable = $3->e_value;
 
 		if (mras) {
 			if (ci_strcmp(tempbuf, "on") == 0)
@@ -2389,52 +2482,9 @@ statement:
 			expr_number_check($3);
 			expr_free($3);
 		}
-		goto doloptA;
-	dolopt:
-		enable = 1;
-	doloptA:
-		linecnt++;
-		if (outpass) {
-			lineptr = linebuf;
-			switch ($1->i_value) {
-			case 0:	/* list */
-				if (enable < 0) lstoff = 1;
-				if (enable > 0) lstoff = 0;
-				break;
 
-			case 1:	/* eject */
-				if (enable) eject();
-				break;
+		dolopt($1, enable);
 
-			case 2:	/* space */
-				if ((line + enable) > 60) eject();
-				else space(enable);
-				break;
-
-			case 3:	/* elist */
-				eopt = edef;
-				if (enable < 0) eopt = 0;
-				if (enable > 0) eopt = 1;
-				break;
-
-			case 4:	/* fopt */
-				fopt = fdef;
-				if (enable < 0) fopt = 0;
-				if (enable > 0) fopt = 1;
-				break;
-
-			case 5:	/* gopt */
-				gopt = gdef;
-				if (enable < 0) gopt = 1;
-				if (enable > 0) gopt = 0;
-				break;
-
-			case 6: /* mopt */
-				mopt = mdef;
-				if (enable < 0) mopt = 0;
-				if (enable > 0) mopt = 1;
-			}
-		}
 	dolopt_done: ;
 	}
 |
@@ -2471,11 +2521,11 @@ statement:
 		list1();
 	}
 |
-	SETSEG '\n' {
-		if (relopt && segment != $1->i_value) {
-			segment = $1->i_value;
+	label.part SETSEG '\n' {
+		if (relopt && segment != $2->i_value) {
+			segment = $2->i_value;
 			segchange = 1;
-			dollarsign = seg_pos[$1->i_value];
+			dollarsign = seg_pos[$2->i_value];
 		}
 		list1();
 	}
@@ -2490,7 +2540,7 @@ statement:
 		$1->i_token = MNAME;
 		$1->i_pass = npass;
 		$1->i_value = mfptr;
-		if (keyword($1->i_string)) {
+		if (keyword($1->i_string) && !driopt) {
 			sprintf(detail, "Macro '%s' will override the built-in '%s'",
 				$1->i_string, $1->i_string);
 			errwarn(warn_general, detail);
@@ -2502,10 +2552,10 @@ statement:
 		list1();
 	}
 	locals {
-		mlex_list_on++;
+		mlex_list_on += !iopt;
 		mfseek(mfile, (long)mfptr, 0);
 		mlex($7);
-		mlex_list_on--;
+		mlex_list_on -= !iopt;
 		parm_number = 0;
 	}
 |
@@ -2831,8 +2881,8 @@ operation:
 |
 	SHIFT
 		{
-			if (!z80 && $1->i_value < 2)
-				emit(1, E_CODE, 0, 007 | ($1->i_value << 3));
+			if (!z80 && ($1->i_value & 070) < 020)
+				emit(1, E_CODE, 0, 007 | ($1->i_value & 070));
 			else
 				err[fflag]++;
 		}
@@ -2878,39 +2928,40 @@ operation:
 		{ emit1(0306, 0, $4, ET_BYTE); }
 |
 	ARITHC expression
-		{ emit1(0306 + ($1->i_value << 3), 0, $2, ET_BYTE); }
+		{ emit1(0306 + ($1->i_value & 070), 0, $2, ET_BYTE); }
 |
 	ARITHC ACC ',' expression
-		{ emit1(0306 + ($1->i_value << 3), 0, $4, ET_BYTE); }
+		{ emit1(0306 + ($1->i_value & 070), 0, $4, ET_BYTE); }
 |
 	LOGICAL expression
 		{
-			if (!z80 && $1->i_value == 7)
+			// CP is CALL P in 8080
+			if (!z80 && $1->i_value == 0270 && $1->i_string[1] == 'p')
 				emit(1, E_CODE16, $2, 0364);
 			else
-				emit1(0306 | ($1->i_value << 3), 0, $2, ET_BYTE);
+				emit1(0306 | ($1->i_value & 070), 0, $2, ET_BYTE);
 		}
 |
 	AND expression
-		{ emit1(0306 | ($1->i_value << 3), 0, $2, ET_BYTE); }
+		{ emit1(0306 | ($1->i_value & 070), 0, $2, ET_BYTE); }
 |
 	OR expression
-		{ emit1(0306 | ($1->i_value << 3), 0, $2, ET_BYTE); }
+		{ emit1(0306 | ($1->i_value & 070), 0, $2, ET_BYTE); }
 |
 	XOR expression
-		{ emit1(0306 | ($1->i_value << 3), 0, $2, ET_BYTE); }
+		{ emit1(0306 | ($1->i_value & 070), 0, $2, ET_BYTE); }
 |
 	LOGICAL ACC ',' expression	/* -cdk */
-		{ emit1(0306 | ($1->i_value << 3), 0, $4, ET_BYTE); }
+		{ emit1(0306 | ($1->i_value & 070), 0, $4, ET_BYTE); }
 |
 	AND ACC ',' expression	/* -cdk */
-		{ emit1(0306 | ($1->i_value << 3), 0, $4, ET_BYTE); }
+		{ emit1(0306 | ($1->i_value & 070), 0, $4, ET_BYTE); }
 |
 	OR ACC ',' expression	/* -cdk */
-		{ emit1(0306 | ($1->i_value << 3), 0, $4, ET_BYTE); }
+		{ emit1(0306 | ($1->i_value & 070), 0, $4, ET_BYTE); }
 |
 	XOR ACC ',' expression	/* -cdk */
-		{ emit1(0306 | ($1->i_value << 3), 0, $4, ET_BYTE); }
+		{ emit1(0306 | ($1->i_value  & 070), 0, $4, ET_BYTE); }
 |
 	ADD allreg
 		{ emit1(0200 + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
@@ -2922,60 +2973,60 @@ operation:
 		{ emit(1, E_CODE, 0, 0206); }
 |
 	ARITHC allreg
-		{ emit1(0200 + ($1->i_value << 3) + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
 |
 	ARITHC ACC ',' allreg
-		{ emit1(0200 + ($1->i_value << 3) + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
 |
 	ARITHC m
-		{ emit1(0200 + ($1->i_value << 3) + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
 |
 	LOGICAL allreg
-		{ emit1(0200 + ($1->i_value << 3) + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
 |
 	LOGICAL m
-		{ emit1(0200 + ($1->i_value << 3) + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
 |
 	AND allreg
-		{ emit1(0200 + ($1->i_value << 3) + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
 |
 	OR allreg
-		{ emit1(0200 + ($1->i_value << 3) + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
 |
 	XOR allreg
-		{ emit1(0200 + ($1->i_value << 3) + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
 |
 	LOGICAL ACC ',' allreg		/* -cdk */
-		{ emit1(0200 + ($1->i_value << 3) + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
 |
 	AND ACC ',' allreg		/* -cdk */
-		{ emit1(0200 + ($1->i_value << 3) + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
 |
 	OR ACC ',' allreg		/* -cdk */
-		{ emit1(0200 + ($1->i_value << 3) + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
 |
 	XOR ACC ',' allreg		/* -cdk */
-		{ emit1(0200 + ($1->i_value << 3) + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
 |
 	SHIFT reg
-		{ emit1(0145400 + ($1->i_value << 3) + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
 |
 	SHIFT_XY dxy
 		{
-			emit(4, E_CODE, 0, $1->i_value >> 8, 0xcb, disp, $1->i_value);
+			emit(4, E_CODE, 0, $1->i_value >> 24, $1->i_value >> 16, disp, $1->i_value);
 		}
 |
 	SHIFT memxy ',' realreg
-		{ emit1(0xCB00 + ($1->i_value << 3) + ($4 & 0377), $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + ($4 & 0377), $2, 0, ET_NOARG_DISP); }
 |
 	INCDEC	allreg
-		{ emit1($1->i_value + (($2 & 0377) << 3) + 4, $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + (($2 & 0377) << 3), $2, 0, ET_NOARG_DISP); }
 |
 	INRDCR	reg8
-		{ emit1($1->i_value + (($2 & 0377) << 3) + 4, $2, 0, ET_NOARG_DISP); }
+		{ emit1($1->i_value + (($2 & 0377) << 3), $2, 0, ET_NOARG_DISP); }
 |
 	ARITHC HL ',' bcdehlsp
-		{ if ($1->i_value == 1)
+		{ if ($1->i_value == 0210)
 				emit(2,E_CODE,0,0355,0112+$4);
 			else
 				emit(2,E_CODE,0,0355,0102+$4);
@@ -3019,10 +3070,10 @@ operation:
 		}
 |
 	INCDEC evenreg
-		{ emit1(($1->i_value << 3) + ($2 & 0377) + 3, $2, 0, ET_NOARG); }
+		{ emit1((($1->i_value & 1) << 3) + ($2 & 0377) + 3, $2, 0, ET_NOARG); }
 |
 	INXDCX evenreg8
-		{ emit1(($1->i_value << 3) + ($2 & 0377) + 3, $2, 0, ET_NOARG); }
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG); }
 |
 	PUSHPOP pushable
 		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG); }
@@ -3062,7 +3113,7 @@ operation:
 			expr_free($2);
 			if (bit < 0 || bit > 7)
 				err[vflag]++;
-			emit(4, E_CODE, 0, $1->i_value >> 8, 0xcb, disp,
+			emit(4, E_CODE, 0, $1->i_value >> 24, $1->i_value >> 16, disp,
 				$1->i_value | (bit << 3));
 		}
 |
@@ -3238,13 +3289,13 @@ operation:
 	LD MISCREG ',' ACC
 		{ emit(2, E_CODE, 0, 0355, 0107 + $2->i_value); }
 |
-	LD evenreg ',' lxexpression
+	LD evenreg ',' noparenexpr
 		{
 			expr_word_check($4);
 			emit1(1 + ($2 & 060), $2, $4, ET_WORD);
 		}
 |
-	LXI evenreg8 ',' lxexpression
+	LXI evenreg8 ',' expression
 		{
 			expr_word_check($4);
 			emit1(1 + ($2 & 060), $2, $4, ET_WORD);
@@ -3415,8 +3466,12 @@ operation:
 		{
 			expr_reloc_check($2);
 			// Cannot org to the other segment (but absolute values are OK)
-			if (relopt && segment && ($2->e_scope & SCOPE_SEGMASK) != segment)
+			if (relopt && segment &&
+				($2->e_scope & SCOPE_SEGMASK) &&
+				($2->e_scope & SCOPE_SEGMASK) != segment)
+			{
 				err[rflag]++;
+			}
 			if (phaseflag) {
 				err[oflag]++;
 				dollarsign = phdollar + dollarsign - phbegin;
@@ -3477,6 +3532,8 @@ operation:
 	DEFB { full_exprs = 1; } db.list { full_exprs = 0; }
 |
 	DEFW { full_exprs = 1; } dw.list { full_exprs = 0; }
+|
+	DEF3 { full_exprs = 1; } d3.list { full_exprs = 0; }
 |
 	DEFD { full_exprs = 1; } dd.list { full_exprs = 0; }
 |
@@ -3709,6 +3766,8 @@ mar:
 			$$ = $1->i_value;
 		}
 ;
+aliasable: REGNAME | ACC | TK_C | AF | PSW | RP | HL | INDEX | SP | COND;
+
 condition:
 	spcondition
 |
@@ -3732,12 +3791,6 @@ db.list:
 	db.list ',' db.list.element
 ;
 db.list.element:
-	TWOCHAR
-		{
-			emit(1, E_DATA, expr_num($1));
-			emit(1, E_DATA, expr_num($1>>8));
-		}
-|
 	STRING
 		{
 			cp = $1;
@@ -3747,9 +3800,18 @@ db.list.element:
 |
 	expression
 		{
-			if (is_number($1) && ($1->e_value < -128 || $1->e_value > 255))
-				err[vflag]++;
-			emit(1, E_DATA, $1);
+			// Allow a single "TWOCHAR" value...
+			if ($1->e_scope & SCOPE_TWOCHAR) {
+				emit(1, E_DATA, expr_num($1->e_value & 0xff));
+				emit(1, E_DATA, expr_num($1->e_value >> 8));
+			}
+			else {
+				if (is_number($1) && ($1->e_value < -128 || $1->e_value > 255)) {
+					err[vflag]++;
+				}
+
+				emit(1, E_DATA, $1);
+			}
 		}
 ;
 
@@ -3771,6 +3833,23 @@ dw.list.element:
 		}
 ;
 
+d3.list:
+	d3.list.element
+|
+	d3.list ',' d3.list.element
+;
+
+
+d3.list.element:
+	expression
+		{
+			if ($1->e_value < -0x800000 || $1->e_value > 0xffffff) {
+				err[vflag]++;
+			}
+			emit(3, E_DATA, $1);
+		}
+;
+
 dd.list:
 	dd.list.element
 |
@@ -3783,17 +3862,6 @@ dd.list.element:
 		{
 			// Can't check overflow as I only have 32 bit ints.
 			emit(4, E_DATA, $1);
-		}
-;
-
-
-
-lxexpression:
-	noparenexpr
-|
-	TWOCHAR
-		{
-			$$ = expr_num($1);
 		}
 ;
 
@@ -3837,6 +3905,13 @@ noparenexpr:
 			$$ = expr_num($1);
 		}
 |
+	TWOCHAR
+		{
+			$$ = expr_num($1);
+			// Mark as twochar for db.list hackery
+			$$->e_scope |= SCOPE_TWOCHAR;
+		}
+|
 	EQUATED
 		{
 			$$ = expr_var($1);
@@ -3865,13 +3940,25 @@ noparenexpr:
 |
 	UNDECLARED
 		{
+			int chkext = 1;
 			$$ = expr_alloc();
 			$$->e_token = 'u';
 			$$->e_item = $1;
 			$$->e_scope = $1->i_scope;
 			$$->e_value = 0;
 
-			if (!($1->i_scope & SCOPE_EXTERNAL)) {
+			if (!nmnvopt) {
+				// Allow use of JMP, RET, etc. as values.
+				struct item *i = keyword($1->i_string);
+				if (item_is_verb(i)) {
+					chkext = 0;
+					$1 = i;
+					$$->e_item = i;
+					$$->e_value = item_value(i);
+				}
+			}
+
+			if (chkext && !($1->i_scope & SCOPE_EXTERNAL)) {
 				sprintf(detail, "'%s' %s", $1->i_string, errname[uflag]);
 				// Would be nice to add to list of undeclared errors
 				errwarn(uflag, detail);
@@ -4171,16 +4258,16 @@ struct	item	keytab[] = {
 	{".8080",	0,	INSTSET,	VERB },
 	{"a",		7,	ACC,		I8080 | Z80 },
 	{"aci",		0316,	ALUI8,		VERB | I8080 },
-	{"adc",		1,	ARITHC,		VERB | I8080 | Z80  },
+	{"adc",		0210,	ARITHC,		VERB | I8080 | Z80  },
 	{"adcx",	0xdd8e,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"adcy",	0xfd8e,	ALU_XY,		VERB | Z80 | ZNONSTD },
-	{"add",		0,	ADD,		VERB | I8080 | Z80  },
+	{"add",		0200,	ADD,		VERB | I8080 | Z80  },
 	{"addx",	0xdd86,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"addy",	0xfd86,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"adi",		0306,	ALUI8,		VERB | I8080 },
 	{"af",		060,	AF,		Z80 },
-	{"ana",		4,	ARITHC,		VERB | I8080},
-	{"and",		4,	AND,		VERB | Z80 | TERM },
+	{"ana",		0240,	ARITHC,		VERB | I8080},
+	{"and",		0240,	AND,		VERB | Z80 | TERM },
 	{".and.",	0,	MROP_AND,	TERM | MRASOP },
 	{"andx",	0xdda6,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"andy",	0xfda6,	ALU_XY,		VERB | Z80 | ZNONSTD },
@@ -4192,8 +4279,8 @@ struct	item	keytab[] = {
 	{"b",		0,	REGNAME,	I8080 | Z80 },
 	{"bc",		0,	RP,		Z80 },
 	{"bit",		0145500,BIT,		VERB | Z80 },
-	{"bitx",	0xdd46,	BIT_XY,		VERB | Z80 | ZNONSTD },
-	{"bity",	0xfd46,	BIT_XY,		VERB | Z80 | ZNONSTD },
+	{"bitx",	0xddcb0046,BIT_XY,	VERB | Z80 | ZNONSTD },
+	{"bity",	0xfdcb0046,BIT_XY,	VERB | Z80 | ZNONSTD },
 	{".block",	0,	DEFS,		VERB },
 	{".byte",	0,	DEFB,		VERB },
 	{".bytes",	0,	DC,		VERB },
@@ -4208,7 +4295,7 @@ struct	item	keytab[] = {
 	{"cm",		0374,	CALL8,		VERB | I8080 },
 	{"cma",		057,	NOOPERAND,	VERB | I8080 },
 	{"cmc",		077,	NOOPERAND,	VERB | I8080 },
-	{"cmp",		7,	LOGICAL,	VERB | I8080 },
+	{"cmp",		0270,	LOGICAL,	VERB | I8080 },
 	{"cmpx",	0xddbe,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"cmpy",	0xfdbe,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"cnc",		0324,	CALL8,		VERB | I8080 },
@@ -4216,7 +4303,7 @@ struct	item	keytab[] = {
 	{".comment",	SPCOM,	SPECIAL,	VERB },
 	{".common",	PSCMN,	ARGPSEUDO,	VERB },
 	{".cond",	0,	IF_TK,		VERB },
-	{"cp",		7,	LOGICAL,	VERB | I8080 | Z80 },
+	{"cp",		0270,	LOGICAL,	VERB | I8080 | Z80 },
 	{"cpd",		0166651,NOOPERAND,	VERB | Z80 },
 	{"cpdr",	0166671,NOOPERAND,	VERB | Z80 },
 	{"cpe",		0354,	CALL8,		VERB | I8080 },
@@ -4227,21 +4314,23 @@ struct	item	keytab[] = {
 	{".cseg",	SEG_CODE,SETSEG,	VERB },
 	{"cz",		0314,	CALL8,		VERB | I8080 },
 	{"d",		2,	REGNAME,	I8080 | Z80 },
+	{".d3",		0,	DEF3,		VERB },
 	{"daa",		0047,	NOOPERAND,	VERB | I8080 | Z80 },
-	{"dad",		0,	DAD,		VERB | I8080 },
+	{"dad",		9,	DAD,		VERB | I8080 },
 	{"dadc",	0xed4a,	ARITH16,	VERB | Z80 | ZNONSTD },
 	{"dadx",	0xdd09,	ARITH16,	VERB | Z80 | ZNONSTD },
 	{"dady",	0xfd09,	ARITH16,	VERB | Z80 | ZNONSTD },
 	{".db",		0,	DEFB,		VERB },
 	{".dc",		0,	DC,		VERB },
-	{"dcr",		1,	INRDCR,		VERB | I8080 },
+	{"dcr",		5,	INRDCR,		VERB | I8080 },
 	{"dcrx",	0xdd35,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"dcry",	0xfd35,	ALU_XY,		VERB | Z80 | ZNONSTD },
-	{"dcx",		1,	INXDCX,		VERB | I8080 },
+	{"dcx",		0xb,	INXDCX,		VERB | I8080 },
 	{"dcxix",	0xdd2b,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"dcxiy",	0xfd2b,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"de",		020,	RP,		Z80 },
-	{"dec",		1,	INCDEC,		VERB | I8080 | Z80 },
+	{"dec",		5,	INCDEC,		VERB | I8080 | Z80 },
+	{".def3",	0,	DEF3,		VERB },
 	{".defb",	0,	DEFB,		VERB },
 	{".defd",	0,	DEFD,		VERB },
 	{".defl",	0,	DEFL,		VERB },
@@ -4270,7 +4359,7 @@ struct	item	keytab[] = {
 	{"eq",		0,	EQ,		0 },
 	{".eq.",	0,	MROP_EQ,	TERM | MRASOP },
 	{".equ",	0,	EQU,		VERB },
-	{"ex",		0,	EX,		VERB | Z80 },
+	{"ex",		0xEB,	EX,		VERB | Z80 },
 	{"exaf",	0x08,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{".exitm", 	0,	EXITM,		VERB },
 	{".ext",	0,	EXTRN,		VERB },
@@ -4300,18 +4389,18 @@ struct	item	keytab[] = {
 	{"im2",		0xed5e,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{".import",	PSIMPORT,ARGPSEUDO,	VERB | COL0 },
 	{"in",		0333,	TK_IN,		VERB | I8080 | Z80 },
-	{"inc",		0,	INCDEC,		VERB | Z80 },
+	{"inc",		4,	INCDEC,		VERB | Z80 },
 	{".incbin", 	0, 	INCBIN,		VERB },
 	{".include",	PSINC,	ARGPSEUDO,	VERB | COL0 },	// COL0 only needed for MRAS mode
 	{"ind",		0166652,NOOPERAND,	VERB | Z80 },
 	{"indr",	0166672,NOOPERAND,	VERB | Z80 },
 	{"ini",		0166642,NOOPERAND,	VERB | Z80 },
 	{"inir",	0166662,NOOPERAND,	VERB | Z80 },
-	{"inp",		0,	INP,		VERB | Z80 | ZNONSTD },
-	{"inr",		0,	INRDCR,		VERB | I8080 },
+	{"inp",		0xed40,	INP,		VERB | Z80 | ZNONSTD },
+	{"inr",		4,	INRDCR,		VERB | I8080 },
 	{"inrx",	0xdd34,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"inry",	0xfd34,	ALU_XY,		VERB | Z80 | ZNONSTD },
-	{"inx",		0,	INXDCX,		VERB | I8080 },
+	{"inx",		3,	INXDCX,		VERB | I8080 },
 	{"inxix",	0xdd23,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"inxiy",	0xfd23,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"irp",		0,	IRP,		VERB },
@@ -4327,7 +4416,7 @@ struct	item	keytab[] = {
 	{"jmp",		0303,	JP,		VERB | I8080 },
 	{"jnc",		0322,	JUMP8,		VERB | I8080 },
 	{"jnz",		0302,	JUMP8,		VERB | I8080 },
-	{"jp",		0,	JP,		VERB | I8080 | Z80 },
+	{"jp",		0362,	JP,		VERB | I8080 | Z80 },
 	{"jpe",		0352,	JUMP8,		VERB | I8080 },
 	{".jperror",	0,	JPERROR,	VERB },
 	{"jpo",		0342,	JUMP8,		VERB | I8080 },
@@ -4340,11 +4429,11 @@ struct	item	keytab[] = {
 	{"jz",		0312,	JUMP8,		VERB | I8080 },
 	{"l",		5,	REGNAME,	I8080 | Z80 },
 	{"lbcd",	0xed4b,	LDST16,		VERB | Z80 | ZNONSTD },
-	{"ld",		0,	LD,		VERB | Z80 },
-	{"lda",		0,	LDA,		VERB | I8080 },
+	{"ld",		0x40,	LD,		VERB | Z80 },
+	{"lda",		0x3a,	LDA,		VERB | I8080 },
 	{"ldai",	0xed57,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"ldar",	0xed5f,	NOOPERAND,	VERB | Z80 | ZNONSTD },
-	{"ldax",	0,	LDAX,		VERB | I8080 },
+	{"ldax",	0xA,	LDAX,		VERB | I8080 },
 	{"ldd",		0166650,NOOPERAND,	VERB | Z80 },
 	{"lddr",	0166670,NOOPERAND,	VERB | Z80 },
 	{"lded",	0xed5b,	LDST16,		VERB | Z80 | ZNONSTD },
@@ -4354,7 +4443,7 @@ struct	item	keytab[] = {
 	{"ldy",		0xfd46,	LD_XY,		VERB | Z80 | ZNONSTD},
 	{"le",		0,	LE,		0 },
 	{".le.",	0,	MROP_LE,	TERM | MRASOP },
-	{"lhld",	0,	LHLD,		VERB | I8080 },
+	{"lhld",	0x2a,	LHLD,		VERB | I8080 },
 	{".list",	0,	LIST,		VERB | COL0 }, // COL0 only needed for MRAS
 	{"lixd",	0xdd2a,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"liyd",	0xfd2a,	LDST16,		VERB | Z80 | ZNONSTD },
@@ -4364,7 +4453,7 @@ struct	item	keytab[] = {
 	{"lspd",	0xed7b,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"lt",		0,	LT,		0 },
 	{".lt.",	0,	MROP_LT,	TERM | MRASOP },
-	{"lxi",		0,	LXI,		VERB | I8080 },
+	{"lxi",		1,	LXI,		VERB | I8080 },
 	{"lxix",	0xdd21,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"lxiy",	0xfd21,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"m",		070,	COND,		I8080 | Z80 },
@@ -4375,8 +4464,8 @@ struct	item	keytab[] = {
 	{".mlist",	6,	LIST,		VERB },
 	{"mod",		0,	'%',		0 },
 	{".mod.",	0,	MROP_MOD,	TERM | MRASOP },
-	{"mov",		0,	MOV,		VERB | I8080 },
-	{"mvi",		0,	MVI,		VERB | I8080 },
+	{"mov",		0x40,	MOV,		VERB | I8080 },
+	{"mvi",		6,	MVI,		VERB | I8080 },
 	{"mvix",	0xdd36,	MV_XY,		VERB | Z80 | ZNONSTD },
 	{"mviy",	0xfd36,	MV_XY,		VERB | Z80 | ZNONSTD },
 	{".name",	SPNAME,	SPECIAL,	VERB },
@@ -4392,9 +4481,9 @@ struct	item	keytab[] = {
 	{"nv",		040,	COND,		Z80 },
 	{"nz",		0,	SPCOND,		Z80 },
 	{"ocf",		0,	OCF,		0 },
-	{"or",		6,	OR,		VERB | Z80 | TERM },
+	{"or",		0260,	OR,		VERB | Z80 | TERM },
 	{".or.",	6,	MROP_OR,	TERM | MRASOP },
-	{"ora",		6,	LOGICAL,	VERB | I8080 },
+	{"ora",		0260,	LOGICAL,	VERB | I8080 },
 	{".org",	0,	ORG,		VERB },
 	{"ori",		0366,	ALUI8,		VERB | I8080 },
 	{"orx",		0xddb6,	ALU_XY,		VERB | Z80 | ZNONSTD },
@@ -4406,7 +4495,7 @@ struct	item	keytab[] = {
 	{"outdr",	0166673,NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"outi",	0166643,NOOPERAND,	VERB | Z80 },
 	{"outir",	0166663,NOOPERAND,	VERB | Z80 | ZNONSTD },
-	{"outp",	0,	OUTP,		VERB | Z80 | ZNONSTD },
+	{"outp",	0xED41,	OUTP,		VERB | Z80 | ZNONSTD },
 	{"p",		060,	COND,		Z80 },
 	{".page",	1,	LIST,		VERB },
 	{"pchl",	0351,	NOOPERAND,	VERB | I8080 },
@@ -4428,29 +4517,29 @@ struct	item	keytab[] = {
 	{"pushiy",	0xfde5,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"r",		010,	MISCREG,	Z80 },
 	{"ral",		027,	NOOPERAND,	VERB | I8080 },
-	{"ralr",	2,	SHIFT,		VERB | Z80 | ZNONSTD },
-	{"ralx",	0xdd16,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
-	{"raly",	0xfd16,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"ralr",	0xCB10,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"ralx",	0xddcb0016,SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"raly",	0xfdcb0016,SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"rar",		037,	NOOPERAND,	VERB | I8080 },
-	{"rarr",	3,	SHIFT,		VERB | Z80 | ZNONSTD },
-	{"rarx",	0xdd1e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
-	{"rary",	0xfd1e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"rarr",	0xCB18,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"rarx",	0xddcb001e,SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"rary",	0xfdcb001e,SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"rc",		0330,	NOOPERAND,	VERB | I8080 },
 	{".read",	PSINC,	ARGPSEUDO,	VERB },
 	{"rept",	0,	REPT,		VERB },
 	{"res",		0145600,BIT,		VERB | Z80 },
-	{"resx",	0xdd86,	BIT_XY,		VERB | Z80 | ZNONSTD },
-	{"resy",	0xfd86,	BIT_XY,		VERB | Z80 | ZNONSTD },
+	{"resx",	0xddcb0086,BIT_XY,	VERB | Z80 | ZNONSTD },
+	{"resy",	0xfdcb0086,BIT_XY,	VERB | Z80 | ZNONSTD },
 	{"ret",		0311,	RET,		VERB | I8080 | Z80 },
 	{"reti",	0166515,NOOPERAND,	VERB | Z80 },
 	{"retn",	0166505,NOOPERAND,	VERB | Z80 },
-	{"rl",		2,	SHIFT,		VERB | Z80 },
+	{"rl",		0xCB10,	SHIFT,		VERB | Z80 },
 	{"rla",		027,	NOOPERAND,	VERB | Z80 },
-	{"rlc",		0,	SHIFT,		VERB | I8080 | Z80 },
+	{"rlc",		0xCB00,	SHIFT,		VERB | I8080 | Z80 },
 	{"rlca",	07,	NOOPERAND,	VERB | Z80 },
-	{"rlcr",	0,	SHIFT,		VERB | I8080 | Z80 | ZNONSTD },
-	{"rlcx",	0xdd06,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
-	{"rlcy",	0xfd06,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"rlcr",	0xCB00,	SHIFT,		VERB | I8080 | Z80 | ZNONSTD },
+	{"rlcx",	0xddcb0006,SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"rlcy",	0xfdcb0006,SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"rld",		0166557,NOOPERAND,	VERB | Z80 },
 	{"rm",		0370,	NOOPERAND,	VERB | I8080 },
 	{".rmem",	0,	DEFS,		VERB },
@@ -4459,19 +4548,19 @@ struct	item	keytab[] = {
 	{"rp",		0360,	NOOPERAND,	VERB | I8080 },
 	{"rpe",		0350,	NOOPERAND,	VERB | I8080 },
 	{"rpo",		0340,	NOOPERAND,	VERB | I8080 },
-	{"rr",		3,	SHIFT,		VERB | Z80 },
+	{"rr",		0xCB18,	SHIFT,		VERB | Z80 },
 	{"rra",		037,	NOOPERAND,	VERB | Z80 },
-	{"rrc",		1,	SHIFT,		VERB | I8080 | Z80 },
+	{"rrc",		0xCB08,	SHIFT,		VERB | I8080 | Z80 },
 	{"rrca",	017,	NOOPERAND,	VERB | Z80 },
-	{"rrcr",	1,	SHIFT,		VERB | Z80 | ZNONSTD },
-	{"rrcx",	0xdd0e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
-	{"rrcy",	0xfd0e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"rrcr",	0xCB08,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"rrcx",	0xddcb000e,SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"rrcy",	0xfdcb000e,SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"rrd",		0166547,NOOPERAND,	VERB | Z80 },
 	{"rst",		0307,	RST,		VERB | I8080 | Z80 },
 	{".rsym",	PSRSYM,	ARGPSEUDO,	VERB },
 	{"rz",		0310,	NOOPERAND,	VERB | I8080 },
-	{"sbb",		3,	ARITHC,		VERB | I8080 },
-	{"sbc",		3,	ARITHC,		VERB | Z80 },
+	{"sbb",		0230,	ARITHC,		VERB | I8080 },
+	{"sbc",		0230,	ARITHC,		VERB | Z80 },
 	{"sbcd",	0xed43,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"sbcx",	0xdd9e,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"sbcy",	0xfd9e,	ALU_XY,		VERB | Z80 | ZNONSTD },
@@ -4482,43 +4571,43 @@ struct	item	keytab[] = {
 	{"setb",	0145700,BIT,		VERB | Z80 | ZNONSTD },
 	{".setocf",	0,	SETOCF,		VERB },
 	{".sett",	0,	TSTATE,		VERB },
-	{"setx",	0xddc6,	BIT_XY,		VERB | Z80 | ZNONSTD },
-	{"sety",	0xfdc6,	BIT_XY,		VERB | Z80 | ZNONSTD },
+	{"setx",	0xddcb00c6,BIT_XY,	VERB | Z80 | ZNONSTD },
+	{"sety",	0xfdcb00c6,BIT_XY,	VERB | Z80 | ZNONSTD },
 	{"shl",		0,	SHL,		TERM },
 	{".shl.",	0,	MROP_SHL,	TERM | MRASOP },
-	{"shld",	0,	SHLD,		VERB | I8080 },
+	{"shld",	0x22,	SHLD,		VERB | I8080 },
 	{"shr",		0,	SHR,		TERM },
 	{".shr.",	0,	MROP_SHR,	TERM | MRASOP },
 	{"sixd",	0xdd22,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"siyd",	0xfd22,	LDST16,		VERB | Z80 | ZNONSTD },
-	{"sl1",		6,	SHIFT,		VERB | Z80 | UNDOC },
-	{"sla",		4,	SHIFT,		VERB | Z80 },
-	{"slar",	4,	SHIFT,		VERB | Z80 | ZNONSTD },
-	{"slax",	0xdd26,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
-	{"slay",	0xfd26,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
-	{"sll",		6,	SHIFT,		VERB | Z80 },
+	{"sl1",		0xCB30,	SHIFT,		VERB | Z80 | UNDOC },
+	{"sla",		0xCB20,	SHIFT,		VERB | Z80 },
+	{"slar",	0xCB20,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"slax",	0xddcb0026,SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"slay",	0xfdcb0026,SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"sll",		0xCB30,	SHIFT,		VERB | Z80 },
 	{"sp",		060,	SP,		I8080 | Z80 },
 	{".space",	2,	LIST,		VERB },
 	{"sphl",	0371,	NOOPERAND,	VERB | I8080 },
 	{"spix",	0xddf9,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"spiy",	0xfdf9,	NOOPERAND,	VERB | Z80 | ZNONSTD },
-	{"sra",		5,	SHIFT,		VERB | Z80 },
-	{"srar",	5,	SHIFT,		VERB | Z80 | ZNONSTD },
-	{"srax",	0xdd2e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
-	{"sray",	0xfd2e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
-	{"srl",		7,	SHIFT,		VERB | Z80 },
-	{"srlr",	7,	SHIFT,		VERB | Z80 | ZNONSTD },
-	{"srlx",	0xdd3e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
-	{"srly",	0xfd3e,	SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"sra",		0xCB28,	SHIFT,		VERB | Z80 },
+	{"srar",	0xCB28,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"srax",	0xddcb002e,SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"sray",	0xfdcb002e,SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"srl",		0xCB38,	SHIFT,		VERB | Z80 },
+	{"srlr",	0xCB38,	SHIFT,		VERB | Z80 | ZNONSTD },
+	{"srlx",	0xddcb003e,SHIFT_XY,	VERB | Z80 | ZNONSTD },
+	{"srly",	0xfdcb003e,SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"sspd",	0xed73,	LDST16,		VERB | Z80 | ZNONSTD },
-	{"sta",		0,	STA,		VERB | I8080 },
+	{"sta",		0x32,	STA,		VERB | I8080 },
 	{"stai",	0xed47,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"star",	0xed4f,	NOOPERAND,	VERB | Z80 | ZNONSTD },
-	{"stax",	0,	STAX,		VERB | I8080 },
+	{"stax",	2,	STAX,		VERB | I8080 },
 	{"stc",		067,	NOOPERAND,	VERB | I8080 },
 	{"stx",		0xdd70,	ST_XY,		VERB | Z80 | ZNONSTD},
 	{"sty",		0xfd70,	ST_XY,		VERB | Z80 | ZNONSTD},
-	{"sub",		2,	LOGICAL,	VERB | I8080 | Z80 },
+	{"sub",		0220,	LOGICAL,	VERB | I8080 | Z80 },
 	{".subttl",	SPSBTL,	SPECIAL,	VERB },
 	{"subx",	0xdd96,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"suby",	0xfd96,	ALU_XY,		VERB | Z80 | ZNONSTD },
@@ -4527,17 +4616,17 @@ struct	item	keytab[] = {
 	{".text",	0,	DEFB,		VERB },
 	{"tihi",	0,	TIHI,		0 },
 	{"tilo",	0,	TILO,		0 },
-	{".title",	SPTITL,	SPECIAL,	VERB },
+	{".title",	SPTITL,	SPECIAL,	VERB | COL0},
 	{".tstate",	0,	TSTATE,		VERB },
 	{"v",		050,	COND,		Z80 },
 	{".word",	0,	DEFW,		VERB },
 	{".wsym",	PSWSYM,	ARGPSEUDO,	VERB },
 	{"xchg",	0353,	NOOPERAND,	VERB | I8080 },
-	{"xor",		5,	XOR,		VERB | Z80 | TERM },
-	{".xor.",	5,	MROP_XOR,	TERM | MRASOP },
+	{"xor",		0250,	XOR,		VERB | Z80 | TERM },
+	{".xor.",	0,	MROP_XOR,	TERM | MRASOP },
 	{"xorx",	0xddae,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"xory",	0xfdae,	ALU_XY,		VERB | Z80 | ZNONSTD },
-	{"xra",		5,	LOGICAL,	VERB | I8080 },
+	{"xra",		0250,	LOGICAL,	VERB | I8080 },
 	{"xri",		0356,	ALUI8,		VERB | I8080 },
 	{"xthl",	0343,	NOOPERAND,	VERB | I8080 },
 	{"xtix",	0xdde3,	NOOPERAND,	VERB | Z80 | ZNONSTD },
@@ -4553,7 +4642,36 @@ struct	item	keytab[] = {
 struct item	itemtab[ITEMTABLESIZE];
 struct item	*itemmax = itemtab+ITEMTABLESIZE;
 
+int item_is_verb(struct item *i)
+{
+	return i && (i->i_uses & VERB) == VERB;
+}
 
+int item_value(struct item *i)
+{
+	int value = i->i_value;
+
+	// Some special cases for 8080 opcode values.
+	if (!z80) {
+		// CP is CALL P in 8080
+		if (i->i_value == 0270 && i->i_string[1] == 'p')
+			value = 0364;
+		else if (i->i_value == 0166641) // CPI
+			value = 0376;
+		else if (i->i_token == SHIFT && (i->i_value & 070) < 020)
+			value = 7 | (i->i_value & 070);
+	}
+	else {
+		if (i->i_token == JR)
+			value = 0x18;
+		else if (i->i_token == JP)
+			value = 0xC3;
+
+		value = sized_byteswap(value);
+	}
+
+	return value;
+}
 
 /*
  *  lexical analyser, called by yyparse.
@@ -4734,6 +4852,11 @@ int lex()
 				printf("was parsing '%s'\n", tempbuf);
 				error(symlong);
 			}
+
+			if (driopt && c == '$') {
+				c = nextchar();
+				continue;
+			}
 			*p = (c >= 'A' && c <= 'Z') ? c + 'a' - 'A' : c;
 			if (mras && *p == '?') {
 				char *q;
@@ -4757,6 +4880,9 @@ int lex()
 			c = nextchar();
 		} while	(charclass[c]==LETTER || charclass[c]==DIGIT ||
 			charclass[c]==STARTER || charclass[c]==DOLLAR);
+
+		if (driopt && p == tempbuf)
+			*p++ = '$'; // reverse overzelous stripping
 
 		*p = '\0';
 
@@ -5146,6 +5272,14 @@ int check_keytab()
 				keytab[i].i_string);
 			return 0;
 		}
+
+		// Uncomment to liat all 8080 verbs to assist documentation.
+		//if ((keytab[i].i_uses & (VERB | I8080)) == (VERB | I8080))
+		//	printf("\tdb\t%s\n", keytab[i].i_string);
+		// Uncomment to liat all Z-80 verbs to assist documentation.
+		//if ((keytab[i].i_uses & (VERB | Z80)) == (VERB | Z80))
+		//	printf("%-6s   $%X\n", keytab[i].i_string,
+		//		item_value(keytab + i));
 	}
 
 	printf("keytab OK\n");
@@ -5183,7 +5317,17 @@ struct item *keyword(char *name)
 			l = i+1;
 	}
 
+	// Check if there's an alias.
+	ip = locate(name);
+	if (ip && (ip->i_scope & SCOPE_ALIAS))
+		return keytab + ip->i_value;
+
 	return 0;
+}
+
+int keyword_index(struct item *k)
+{
+	return k - keytab;
 }
 
 // Find 'name' in an item table.  Returns an empty slot if not found.
@@ -5415,6 +5559,42 @@ int getcol()
 	return inpptr - inpbuf;
 }
 
+void dri_setmacro(int op) {
+	if (op == '-') {
+		mopt = 0;
+	} else if (op == '+') {
+		mopt = 1;
+	} else { // '*'
+		mopt = 2;
+	}
+}
+
+int mc_quote;
+int mc_first;
+
+void start_multi_check()
+{
+	mc_quote = -1;
+	mc_first = 1;
+}
+
+int found_multi(int ch)
+{
+
+	if (ch == mc_quote && (mc_quote == '"' || mc_quote == '\''))
+		mc_quote = -1;
+	else if (ch == '\'' || ch == '"' || ch == ';')
+		mc_quote = ch;
+	else if (ch == '*' && mc_first)
+		mc_quote = '*';
+
+	mc_first = 0;
+	if (ch == separator && mc_quote < 0)
+		return 1;
+
+	return 0;
+}
+
 /*
  *  get the next character
  */
@@ -5443,10 +5623,34 @@ int nextchar()
 			void analyze_inpbuf(void);
 			void mras_operator_separate(void);
 
-			if (!expptr)
+			if (driopt && inpptr[0] == '*') {
+				addtoline(*inpptr++);
+				c = skipline(inpptr[0]);
+				linein[now_in]++;
+				return c;
+			}
+
+			if (!expptr && !prev_multiline)
 				linein[now_in]++;
 
 			analyze_inpbuf();
+
+			// TODO - I think this code and comnt is unnecessary
+			if (driopt && comnt) {
+				addtoline(*inpptr++);
+				c = skipline(*inpptr);
+				linein[now_in]++;
+				return c;
+			}
+
+			if (macopt) {
+				dri_setmacro(macopt);
+				addtoline(*inpptr++);
+				c = skipline(inpptr[0]);
+				linein[now_in]++;
+				macopt = 0;
+				return c;
+			}
 
 			if (mras)
 				mras_operator_separate();
@@ -5475,6 +5679,7 @@ int nextchar()
 
 	// If invoking a macro then pull the next line from it.
 	if (expptr) {
+		start_multi_check();
 		for (;;) {
 			ch = getm();
 
@@ -5502,12 +5707,20 @@ int nextchar()
 
 				if (ch == '\n')
 					break;
+
+				if (found_multi(ch)) {
+					p[-1] = '\n';
+					multiline = 1;
+					break;
+				}
 			}
 		}
 		*p = '\0';
 		p[1] = ch;
 	}
 	else {
+		start_multi_check();
+
 		for (;;) {
 			ch = nextline_peek != NOPEEK ? nextline_peek : getc(now_file);
 			nextline_peek = NOPEEK;
@@ -5527,6 +5740,12 @@ int nextchar()
 
 			if (ch == '\n') 
 				break;
+
+			if (found_multi(ch) && !inmlex) {
+				p[-1] = '\n';
+				multiline = 1;
+				break;
+			}
 		}
 
 		*p = '\0';
@@ -5590,6 +5809,8 @@ void analyze_inpbuf(void)
 	struct item *ip, *word1item;
 	int triplecase = 1;
 
+	macopt = 0;
+
 	// No need to do this when pulling in data for a macro.  In fact,
 	// in can be harmful to undef a macro.
 	if (inmlex)
@@ -5610,11 +5831,25 @@ void analyze_inpbuf(void)
 	p = skipspace(p);
 	word1 = p;
 
+	// Special comment if first non-space char is '*'
+	if (driopt) {
+		comnt = (*p == '*');
+		if (comnt)
+			return;
+	}
+
 	// Now skip over a token or abort if we don't find one
 
 	cc = CHARCLASS(*p);
 	if (cc != LETTER && cc != STARTER && cc != DIGIT && cc != DOLLAR)
 		return;
+
+	if (driopt && *p == '$' && (p[1] == '-' || p[1] == '+' || p[1] == '*') &&
+		strncasecmp(p + 2, "macro", 5) == 0 &&
+		(p[7] == 0 || p[7] == '\n' || CHARCLASS(p[7]) == SPACE))
+	{
+		macopt = p[1];
+	}
 
 	for (;;) {
 		cc = CHARCLASS(*p);
@@ -5850,7 +6085,7 @@ void usage(char *msg, char *param)
 	fprintf(stderr, "\n");
 	version();
 	fprintf(stderr, "usage: zmac [-8bcefghijJlLmnopstz] [-I dir] [-Pk=n] file[.z]\n");
-	fprintf(stderr, "other opts: --rel[7] --mras --zmac --dep --help --doc --version\n");
+	fprintf(stderr, "other opts: --rel[7] --mras --zmac --dri --nmnv --dep --help --doc --version\n");
 	fprintf(stderr, "  zmac -h for more detail about options.\n");
 	exit(1);
 }
@@ -5886,6 +6121,7 @@ void help()
 	fprintf(stderr, "   --od\tdir\tdirectory unnamed output files (default \"zout\")\n");
 	fprintf(stderr, "   --oo\thex,cmd\toutput only listed file suffix types\n");
 	fprintf(stderr, "   --xo\tlst,cas\tdo not output listed file suffix types\n");
+	fprintf(stderr, "   --nmnv\tdo not interpret mnemonics as values in expressions\n");
 	fprintf(stderr, "   --dep\tlist files included\n");
 	fprintf(stderr, "   --mras\tlimited MRAS/EDAS compatibility\n");
 	fprintf(stderr, "   --rel\toutput .rel file only (--rel7 for 7 character symbol names)\n");
@@ -5906,6 +6142,8 @@ int main(int argc, char *argv[])
 	extern  yydebug;
 #endif
 
+	separator = '\\';
+
 	fin[0] = stdin;
 	now_file = stdin;
 	files = 0;
@@ -5921,6 +6159,12 @@ int main(int argc, char *argv[])
 		if (strcmp(argv[i], "--mras") == 0) {
 			mras = 1;
 			trueval = -1;
+			continue;
+		}
+
+		if (strcmp(argv[i], "--dri") == 0) {
+			driopt = 1;
+			separator = '!';
 			continue;
 		}
 
@@ -5941,6 +6185,11 @@ int main(int argc, char *argv[])
 
 		if (strcmp(argv[i], "--dep") == 0) {
 			note_depend = 1;
+			continue;
+		}
+
+		if (strcmp(argv[i], "--nmnv") == 0) {
+			nmnvopt = 1;
 			continue;
 		}
 
@@ -6692,7 +6941,7 @@ void setvars()
 	inpptr = 0;
 	nextline_peek = NOPEEK;
 	raw = 0;
-	linein[now_in] = linecnt = 0;
+	linein[now_in] = 0;
 	exp_number = 0;
 	emitptr = emitbuf;
 	lineptr = linebuf;
@@ -6728,7 +6977,9 @@ void setvars()
 	mfptr = 0;
 	mfseek(mfile, mfptr, 0);
 
-	// These are slighly harmful, but not too bad.  Only
+	// TODO - maybe these could be just as well handled lexically
+	// like the 8080 opcodes in DRI mode?
+	// These are slightly harmful, but not too bad.  Only
 	// absolutely necessary for MAC compatibility.  But there's
 	// some use in having them available always.
 
@@ -6744,6 +6995,7 @@ void setvars()
 	equate("sp", 6);
 	equate("psw", 6);
 
+	// TODO - these are now handled lexically in --dri mode
 	// There are a large number of symbols to add to support
 	// "LXI H,MOV" and the like.
 
@@ -6884,19 +7136,25 @@ void putsymtab()
 
 				fprintf(fout, "%-15s%c", tp->i_string, c);
 
-				if (relopt)
-					seg = SEGCHAR(tp->i_scope & SCOPE_SEGMASK);
+				if (tp->i_scope & SCOPE_ALIAS)
+					fprintf(fout, "\"%s\"",
+						keytab[tp->i_value].i_string);
 
-				if (tp->i_value >> 16)
-					fprintf(fout, "%8x%c", tp->i_value, seg);
-				else
-					fprintf(fout, "%4x%c    ", tp->i_value & 0xffff, seg);
+				else {
+					if (relopt)
+						seg = SEGCHAR(tp->i_scope & SCOPE_SEGMASK);
 
-				if (tp->i_scope & SCOPE_EXTERNAL)
-					fprintf(fout, " (extern)");
+					if (tp->i_value >> 16)
+						fprintf(fout, "%8x%c", tp->i_value, seg);
+					else
+						fprintf(fout, "%4x%c    ", tp->i_value & 0xffff, seg);
 
-				if (tp->i_scope & SCOPE_PUBLIC)
-					fprintf(fout, " (public)");
+					if (tp->i_scope & SCOPE_EXTERNAL)
+						fprintf(fout, " (extern)");
+
+					if (tp->i_scope & SCOPE_PUBLIC)
+						fprintf(fout, " (public)");
+				}
 			}
 		}
 		lineout();
@@ -7926,7 +8184,7 @@ void putout(int value)
 	OUTREC_DATA(outrec, outlen) = value;
 	outlen++;
 
-	if (outlen >= 256)
+	if (outlen >= 255)
 		new_outrec();
 
 	advance_segment(1);
@@ -7987,6 +8245,13 @@ void booklist(int seg, int addr, int data, struct bookmark *book)
 			fputs("\n", fout);
 
 		lineout();
+
+		book_row++;
+		book_col = 0;
+
+		if (!gopt && !book->line)
+			return;
+
 		if (nopt) putc('\t', fout);
 		if (copt) fputs("        ", fout);
 
@@ -7997,8 +8262,6 @@ void booklist(int seg, int addr, int data, struct bookmark *book)
 
 		book_seg = seg;
 		book_addr = addr;
-		book_row++;
-		book_col = 0;
 	}
 
 	if (!gopt && book_row > 0)
@@ -8081,7 +8344,7 @@ void listfrombookmark()
 		free(book->line);
 		book->line = 0;
 	}
-	else
+	else if (gopt)
 		fputs("\n", fout);
 }
 
@@ -8752,6 +9015,18 @@ void writewavs(int pad250, int pad500, int pad1500)
 		for (j = 0; j < tailPad; j++)
 			fputc(0x80, wav[i]);
 	}
+}
+
+int sized_byteswap(int value)
+{
+	int swapped = 0;
+
+	for (; value; value = (value >> 8) & 0xffffff) {
+		swapped <<= 8;
+		swapped |= value & 0xff;
+	}
+
+	return swapped;
 }
 
 // Tracking whether a file has been imported.
