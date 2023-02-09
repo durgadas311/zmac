@@ -14,7 +14,8 @@ and so on.  For more friendly usage in make files and integrated development
 environments the _-o_, _--oo_, _--xo_ and _--xd_ options may be used to select
 sepcific output file formats and where they are written.
 
-Undocumented@undoc Z-80 instructions are supported as well as 8080 code.
+Undocumented@undoc Z-80 instructions are supported as well as 8080 and
+Z-180 (aka HD64180).
 
 zmac strives to be a powerful assembler with expressions familiar to C
 programmers while providing good backward compatibility with original
@@ -33,10 +34,15 @@ zmac
 [ --rel ]
 [ --rel7 ]
 [ --nmnv ]
+[ --z180 ]
+[ --fcal ]
 [ --doc ]
 [ --zmac ]
 [ -8bcefghijJlLmnopstz ]
 [ filename[.z] ]
+
+Space-separated arguments in the ZMAC__ARGS environment variable are added to
+the end of the command line.
 
 .Options
 
@@ -91,6 +97,11 @@ zmac
   are local to their file thus avoid multiple definition when brought in
   with _include_.
  
+ --z180
+  Use Z-180 timings and extended instructions.  Undocumented Z-80 instructions
+  will generate errors as the Z-180 (or H64810) does not support them.
+  Equivalent to _.z180_ pseudo-op.
+ 
  --dep
   Print all files read by _include_, _incbin_ and _import_.
  
@@ -102,6 +113,14 @@ zmac
   can be set from 0 though 9.  _-Pk_ is shorthand for _-Pk=-1_.
   For example, _P4=$123_ effectively puts _@@4 equ $123_ at the top of the
   first file.
+ 
+ -Dsymbol
+  Define _symbol_ to be 1 before assembly.
+ 
+ --fcal
+  Always treat an indentifier in the first column as a label.  zmac uses
+  various heuristics in the case of ambiguity when a label does not have
+  a colon.  This option turns heuristics off.
  
  -8
   Accept 8080 mnemonics preferentially and use 8080 instruction timings.
@@ -365,6 +384,16 @@ _ifdef symbol_
 _ifndef symbol_
 |Like _if_, but tests if _symbol_ has not yet been defined.
 
+_ifeq expr1,expr2_
+
+_ifne expr1,expr2_
+
+_iflt expr1,expr2_
+
+_ifgt expr1,expr2_
+|Shorthand for _if expr1 == expr2_, !=, <, >.  For MRAS and MAC80
+|compatibility.
+
 _import file_
 |Like _include_ but will only bring in the file once.  File tracking is done
 |using only the file name so, for example, an _import file_ will stop
@@ -375,9 +404,11 @@ _include file_
 |Include a file. Like C's (well, cpp's) #include and follows the same
 |include path search rules, but the filename arg
 |lacks the angle brackets or quotes (though single or double quotes may be used).
-|_read_ is a synonym.  _*include file_ also works if started in the first
-|column.  In _--mras_ mode _".asm"_ will be added if _file_ has
-|no suffix.
+|_read_ is a synonym.  _*include file_ and _*get file_ work if started in the
+|first column.  In _--mras_ mode _".asm"_ will be added if _file_ has
+|no suffix and _file/ext_ will be changed to _file.ext_   Original MRAS
+|source uses TRS-80 file system names where _/_ is the extension
+|introducer.
 
 _maclib file_
 |Like _include_ but adds _.lib_ to the file name so includes _file.lib_.
@@ -407,6 +438,12 @@ _8080_
 _z80_
 |Make cycle counting operators return Z-80 cycle counts and
 |interpret any ambiguous assembly statements as Zilog Z-80 mnemonics.
+|_CP_ will be interpreted as "compare accumulator" and _JP_ as "jump unconditionally".
+
+_z180_
+|Allow assembly of Z-180 instructions.
+|Make cycle counting operators return Z-180 cycle counts and
+|interpret any ambiguous assembly statements as Zilog Z-180 mnemonics.
 |_CP_ will be interpreted as "compare accumulator" and _JP_ as "jump unconditionally".
 
 _jperror enable_
@@ -449,8 +486,9 @@ _rlc/rrc/rl/rr/sla/sl1/sra/srl (iy+d),r_
 
 The upper and lower bytes of the _ix_ and _iy_ can be used in a number of
 instructions much in the same way as _d_ and _e_ correspond to the upper and
-lower bytes of _de_.  zmac names these _ixh_, _ixl_, _iyh_ and _iyl_ and
-are referred to generically as _ixylh_ here.
+lower bytes of _de_.  zmac names these _ixh_, _ixl_, _iyh_ and _iyl_.
+Also acceptable are _xh_, _xl_, _yh_, _yl_ and _hx_, _lx_, _hy_, _ly_.
+They are referred to generically as _ixylh_ here.
 
 _inc/dec/add/adc/sub/sbc/and/xor/or/cp ixylh_
 |Arithmetic or logical operation on _ix_ or _iy_ high or low byte.
@@ -578,7 +616,7 @@ Expressions\mrasord change significantly in _--mras_ mode:
 |MRAS operators (_.and._ _.eq._ _.ge._ _.gt._ _.high._ _.le._ _.low._
 |_.lt._ _.mod._ _.ne._ _.not._ _.or._ _.shl._ _.shr._ _.xor._)
 |are recognized even if apparently in identifers.  (e.g., _a.or.b_ is
-|seen as _a .or. _b).
+|seen as _a .or. b_).
 
 |Logical operators return -1 for true and 0 for false.  Normally
 |zmac, like C, uses 1 for true.
@@ -719,7 +757,7 @@ _nop_ instructions:
   
  _endm_
 
-_irpc_ runs through a string of letters assigned them to a variable and
+_irpc_ runs through a string of letters assigning them to a variable and
 expanding the macro block each time.  For example, this will load 7 into
 registers _b_, _d_ and _h_:
 
@@ -862,10 +900,13 @@ and message appear just after the line containing the error.
   A invalid register was given to an instruction.  For example, _LD B,(DE)_
   or _ADD HL,IX_.
  Z
-  Z-80 instruction in 8080 mode error
+  Invalid instruction.
  ##
-  An instruction was assembled that is only valid on the Z-80 but _.8080_
-  (or _-8_) mode is in effect.  However, use use of Z-80 mnemonics that
+  The instruction is not valid for the current architecture.  For example,
+  a Z-80@zmn instruction in 8080 mode (_.8080_ or _-8_ mode is in effect).
+  Or a Z-180@zzmn instruction in 8080 or Z-80 mode.
+  Or an undocumented Z-80 instruction in Z-180 mode.
+  However, use use of Z-80 mnemonics that
   output valid 8080 instructions is always OK.
  H
   $hex constant interpreted as symbol warning
@@ -879,6 +920,10 @@ and message appear just after the line containing the error.
   For statements that have been added as parse rules but have no effect.
   The only current example is _subttl_ which sets the sub title of a listing
   in certain assemblers.
+ W
+  Generic warning
+ ##
+  Higher-level warning; see text of warning for explanation.
 
 ---
 .Output Formats\format
@@ -899,7 +944,8 @@ _--oo rel_ or _-o file.rel_ then all other output formats are suppressed
  .ams
   AMSDOS executable format for Amstrad computers.
  .bds
-  For source-level debugging in trs80gp@http://www.48k.ca/trs80gp.html
+  For source-level debugging and automatic memory protecttion in
+  trs80gp@http://www.48k.ca/trs80gp.html
  .1500.cas
   TRS-80 high-speed (1500 baud) cassette SYSTEM file.  The internal name of the
   file is the source file name shortened to 6 characters with suffixes
@@ -986,9 +1032,74 @@ register usage.  Consider the following code fragment:
  _exx_
 
 Although zmac does nothing but ignore the single quotes they are useful for
-indicating which register we're talking using.  A more advanced mode
-where zmac pays attention to the trailing quotes and emits exchange instrucitons
-as needed has been considered.
+indicating which register is currently active.  A more advanced mode
+where zmac pays attention to the trailing quotes and emits exchange
+instructions as needed has been considered.
+
+---
+.Official Zilog\zsyn Syntax
+
+The official Zilog syntax for Z-80 has some rather arbitrary restrictions
+that zmac ignores.  For instance, _add a,b_ is the only correct form but
+_sub a,b_ is invalid as _sub b_ must be used.
+Here is a list of
+the official and alternate forms of the various affected instructions.
+_rmn_ refers to _a_, _b_, _c_, _d_, _e_, _h_, _l_, _(hl)_, _(ix+d)_, _(iy+d)_
+or 8 bit immediate value.
+
+ _   Official        Accepted Variant _
+  
+ _ add   a,rmn         add   rmn_
+  
+ _ adc   a,rmn         adc   rmn_
+  
+ _ sub   rmn           sub   a,rmn_
+  
+ _ sbc   a,rmn         sbc   rmn_
+  
+ _ cp    rmn           cp    a,rmn_
+  
+ _ and   rmn           and   a,rmn_
+  
+ _ xor   rmn           xor   a,rmn_
+  
+ _ or    rmn           or    a,rmn_
+  
+ _ jp    (hl)          jp    hl_
+  
+ _ jp    (ix)          jp    ix_
+  
+ _ jp    (iy)          jp    iy_
+  
+ _ ex    de,hl         ex    hl,de_
+  
+ _ ex    hl,(sp)       ex    (sp),hl_
+  
+ _ ex    ix,(sp)       ex    (sp),ix_
+  
+ _ ex    iy,(sp)       ex    (sp),iy_
+  
+ _ in    a,(n)         in    a,n_
+  
+ _ out   (n),a         out   n,a_
+  
+ _ in    r,(c)         in    r,(bc)_
+  
+ _ out   (c),r         out   (bc),r_
+  
+ _ rst   8             rst   1_
+  
+ _ rst   16            rst   2_
+  
+ _ rst   24            rst   3_
+  
+ _ rst   32            rst   4_
+  
+ _ rst   40            rst   5_
+  
+ _ rst   48            rst   6_
+  
+ _ rst   56            rst   7_
 
 ---
 .Mnemonic Values\mneval
@@ -1036,7 +1147,7 @@ Values for 8080 mnemonics.  Note that _cpi_ and _jp_ are interpreted as
   
  _ daa $27    lda $3A    rnc $D0   xthl $E3_
 
-Values for Z-80 mnemonics.
+Values for Z-80\zmn mnemonics.
 Ambiguous mnemonics such as _ld_ and _inc_ evaluate to the 8 bit register
 operation base value.  _ex_ is arbitrarily mapped to _ex de,hl_.
 Bit and shift operations on _(IX+d)_ and _(IY+d)_
@@ -1219,6 +1330,28 @@ prevents their use in operations.
  _ory      $B6FD          xtiy     $E3FD_
   
  _otdr     $BBED_
+
+Values for Z-180\zzmn mnemonics.
+
+ _in0      $00ED_
+  
+ _mlt      $4CED_
+  
+ _otdm     $8BED_
+  
+ _otdmr    $9BED_
+  
+ _otim     $83ED_
+  
+ _otimr    $93ED_
+  
+ _out0     $01ED_
+  
+ _slp      $76ED_
+  
+ _tst      $04ED_
+  
+ _tstio    $74ED_
 
 ---
 .Exit Status

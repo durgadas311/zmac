@@ -1,6 +1,6 @@
 %{
 // GWP - keep track of version via hand-maintained date stamp.
-#define VERSION "20jan2019"
+#define VERSION "18oct2022"
 
 /*
  *  zmac -- macro cross-assembler for the Zilog Z80 microprocessor
@@ -17,7 +17,7 @@
  *	5.  Error report
  *	6.  Elimination of sequential searching
  *	7.  Commenting of source
- *	8.  Facilities for system definiton files
+ *	8.  Facilities for system definition files
  *
  * Revision History:
  *
@@ -209,6 +209,28 @@
  *
  * gwp 20-1-19	Z-80 mnemonics usable as values.  --nmnv turns that off.  def3
  *		Register aliases.  Multiple statements per line roughed in.
+ *
+ * gwp 20-4-20	Preserve case of symbols in symbol table.  Output hexadecimal
+ *		in upper case and show decimal value of symbols.
+ *
+ * tjh 9-5-20	Add -Dsym to allow definition of symbols on the command line.
+ *		ZMAC_ARGS environment variable added to command line.
+ *
+ * gwp 25-8-20	Fix crash in "out (c),0".  Make "in f,(c)" work.
+ *
+ * gwp 17-3-21	Stop line buffer overflow when too many "dc" or "incbin" lines
+ *		appear contiguously.  --fcal option and Z-180 instructions.
+ *
+ * gwp 10-4-21	Put code and data indications in .bds output.
+ *
+ * gwp 9-2-22	Fix --z180 and improve usage message on unknown -- flags.
+ *
+ * gwp 10-4-22	Much better symbol table hash function from Al Petrofsky as
+ *		used in gcc and gas.
+ *
+ * gwp 10-18-22	Added *GET, IFEQ, IFEQ, IFLT, IFGT to improved MRAS support.
+ *		Change FILE/EXT to FILE.EXT for includes in --mras mode.
+ *		xh, xl, yh, yl, hx, lx, hy, ly alternates for ixh, ixy, iyh, iyl.
  */
 
 #if defined(__GNUC__)
@@ -228,10 +250,11 @@
 #ifdef _MSC_VER
 #define strdup _strdup
 #define unlink _unlink
+#define strncasecmp _strnicmp
 #endif
 #endif
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <unistd.h>	// just for unlink
 #endif
 
@@ -333,6 +356,8 @@ int keyword_index(struct item *k);
 #define SCOPE_COMBLOCK	(64)
 #define SCOPE_TWOCHAR	(128)
 #define SCOPE_ALIAS	(256)
+#define SCOPE_CMD_P	(512)
+#define SCOPE_CMD_D	(1024)
 
 #define SCOPE_SEGMASK	(3)
 #define SCOPE_SEG(s)	((s) & SCOPE_SEGMASK)
@@ -341,6 +366,7 @@ struct expr {
 	int e_value;
 	int e_scope;
 	int e_token;
+	int e_parenthesized;
 	struct item *e_item;
 	struct expr *e_left;
 	struct expr *e_right;
@@ -433,6 +459,7 @@ int	separator;	// Character that separates multiple statements.
 int	firstcol;
 int	logcol;
 int	coloncnt;
+int first_always_label;
 int	full_exprs;	// expression parsing mode allowing almost any identifier
 struct item *label, pristine_label; // 
 int	list_dollarsign;// flag used to change list output for some operations
@@ -467,7 +494,7 @@ int	now_in ;
 #define jflag	10	/* JP could be JR */
 #define rflag	11	/* expression not relocatable */
 #define gflag	12	/* incorrect register */
-#define zflag	13	/* Z-80 instruction */
+#define zflag	13	/* invalid instruction */
 
 #define FIRSTWARN	warn_hex
 #define	warn_hex	14
@@ -493,13 +520,13 @@ char	*errname[FLAGS]={
 	"Use JR",
 	"Not relocatable",
 	"Register usage",
-	"Z-80 instruction in 8080 mode",
+	"Invalid instruction",
 	"$hex constant interpreted as symbol",
 	"Not implemented",
 	"General"
 };
-char	errdetail[FLAGS][1024];
-char	detail[1024];
+char	errdetail[FLAGS][TEMPBUFSIZE * 2];
+char	detail[TEMPBUFSIZE * 2];
 
 
 unsigned char inpbuf[LINEBUFFERSIZE];
@@ -548,6 +575,12 @@ int	str_getch(struct argparse *ap);
 
 int	mras_undecl_ok;
 int	mras_param[10];
+int	mras_param_set[10];
+
+struct cl_symbol {
+	char *name;
+	struct cl_symbol *next;
+} *cl_symbol_list;
 
 char	inmlex;
 char	mlex_list_on;
@@ -732,6 +765,7 @@ void outsymtab(char *name);
 void compactsymtab();
 void putsymtab();
 void clear();
+void clear_instdata_flags();
 void setmem(int addr, int value, int type);
 void setvars();
 void flushbin();
@@ -789,16 +823,9 @@ void addtoline(int ac)
 	*lineptr++ = ac;
 }
 
-int get_tstates(unsigned char *inst, int *low, int *high, int *fetch)
+int get_tstates(unsigned char *inst, int *low, int *high, int *fetch, char *dis)
 {
-	int len;
-
-	if (z80)
-		len = zi_tstates(inst, low, high, fetch, 0, 0);
-	else
-		len = zi_tstates(inst, 0, 0, fetch, low, high);
-
-	return len;
+	return zi_tstates(inst, z80, low, high, fetch, dis);
 }
 
 /*
@@ -871,27 +898,45 @@ void emit(int bytes, int desc, struct expr *data, ...)
 	{
 		int eaddr = emit_addr, low, fetch, addr_after;
 
-		// emitbuf is OK since this only happens with single emits
+		get_tstates(emitbuf, &low, 0, &fetch, 0);
 
-		if (!z80) {
-			// Check for invalid 8080 instructions.
-			int op = emitbuf[0] & 0xff;
+		// emitbuf is OK since this only happens with single emits
+		int op = emitbuf[0] & 0xff;
+
+		switch (z80) {
+		case 0:
+			// 8080 mode, error if Z-80 instructions.
 			if (op == 0x08 || op == 0x10 || op == 0x18 ||
 			    op == 0x20 || op == 0x28 || op == 0x30 ||
 			    op == 0x38 || op == 0xCB || op == 0xD9 ||
 			    op == 0xDD || op == 0xED || op == 0xFD)
 			{
-				err[zflag]++;
+				errwarn(zflag, "Invalid 8080 instruction");
 			}
-		}
-
-		get_tstates(emitbuf, &low, 0, &fetch);
-
-		// Sanity check
-		if (low <= 0)
-		{
-			fprintf(stderr, "undefined instruction on %02x %02x (assembler or diassembler broken)\n",
-				emitbuf[0], emitbuf[1]);
+			break;
+		case 1: // Z-80 mode, error if Z-180 instructions
+			if (op == 0xED && (
+			    (emitbuf[1] & 0xC6) == 0 || // IN0, OUT0
+			    (emitbuf[1] & 0xC7) == 4 || // TST r
+			    (emitbuf[1] & 0xCF) == 0x4C || // MLT rr
+			    emitbuf[1] == 0x64 || // TST m
+			    emitbuf[1] == 0x74 || // TSTIO (m)
+			    emitbuf[1] == 0x83 || // OTIM
+			    emitbuf[1] == 0x93 || // OTIMR
+			    emitbuf[1] == 0x8B || // OTDM
+			    emitbuf[1] == 0x9B || // OTDMR
+			    emitbuf[1] == 0x76)) // SLP
+			{
+				errwarn(zflag, "Invalid Z-80 instruction");
+			}
+			break;
+		case 2:
+			// Z-180 mode, error if undocumented Z-80 instructions
+			// So many undocumented Z-80 instructions that I lean
+			// on get_states() to answer.
+			if (low <= 0)
+				errwarn(zflag, "Invalid Z-180 instruction");
+			break;
 		}
 
 		// Special case to catch promotion of djnz to DEC B JP NZ
@@ -907,6 +952,14 @@ void emit(int bytes, int desc, struct expr *data, ...)
 			low = 10;
 			// still 1 fetch
 		}
+
+		// Sanity check
+		if (low <= 0 && !err[zflag])
+		{
+			fprintf(stderr, "undefined instruction on %02x %02x (assembler or disassembler broken)\n",
+				emitbuf[0], emitbuf[1]);
+		}
+
 
 		// Double setting of both sides of tstatesum[] seems like too
 		// much, but must be done in the isolated instruction case:
@@ -1464,6 +1517,37 @@ void list_optarg(int optarg, int seg, int type)
 		fputc(type, fout);
 }
 
+void bds_perm(int dollar, int addr, int len)
+{
+	while (len > 0) {
+		int blklen;
+		int usage = memflag[addr & 0xffff] & (MEM_INST | MEM_DATA);
+
+		for (blklen = 0; blklen < len; blklen++) {
+			int u = memflag[(addr + blklen) & 0xffff] & (MEM_INST | MEM_DATA);
+			if (u != usage)
+				break;
+		}
+
+		int bu = 0;
+		if (usage & MEM_INST) bu |= 1;
+		if (usage & MEM_DATA) bu |= 2;
+
+		while (blklen > 0) {
+			int size = blklen;
+			if (size > 255) size = 255;
+			fprintf(fbds, "%04x %04x u %02x %02x\n",
+				dollar, addr & 0xffff, size, bu);
+
+			addr += size;
+			dollar += size;
+			len -= size;
+
+			blklen -= size;
+		}
+	}
+}
+
 void list_out(int optarg, char *line_str, char type)
 {
 	unsigned char *	p;
@@ -1482,7 +1566,7 @@ void list_out(int optarg, char *line_str, char type)
 			    if (emitptr > emitbuf && (memflag[emit_addr] & MEM_INST))
 			    {
 			        int low, high, fetch;
-			        get_tstates(memory + emit_addr, &low, &high, &fetch);
+			        get_tstates(memory + emit_addr, &low, &high, &fetch, 0);
 
 				// Special case to catch promotion of djnz to DEC B JP NZ
 				if (memory[emit_addr] == 5 && emitptr - emitbuf == 4) {
@@ -1523,6 +1607,8 @@ void list_out(int optarg, char *line_str, char type)
 				for (p = emitbuf; p < emitptr; p++)
 					fprintf(fbds, "%02x", *p & 0xff);
 				fprintf(fbds, "\n");
+
+				bds_perm(dollarsign, emit_addr, emitptr - emitbuf);
 			}
 			fprintf(fbds, "%04x %04x s %s", dollarsign, emit_addr, line_str);
 		}
@@ -1830,6 +1916,7 @@ void do_defl(struct item *sym, struct expr *val, int call_list);
 %token <itemptr> HL
 %token <itemptr> INDEX
 %token <itemptr> AF
+%token <itemptr> TK_F
 %token AFp
 %token <itemptr> SP
 %token <itemptr> MISCREG
@@ -1876,7 +1963,7 @@ void do_defl(struct item *sym, struct expr *val, int call_list);
 %token <ival> MROP_SHIFT MROP_SHL MROP_SHR
 %token <ival> MROP_NOT MROP_LOW MROP_HIGH
 %token IF_TK
-%token <itemptr> IF_DEF_TK
+%token <itemptr> IF_DEF_TK IF_CP_TK
 %token ELSE_TK
 %token ENDIF_TK
 %token <itemptr> ARGPSEUDO
@@ -1906,9 +1993,10 @@ void do_defl(struct item *sym, struct expr *val, int call_list);
 %token REPT IRPC IRP EXITM
 %token NUL
 %token <itemptr> MPARM
+%token <itemptr> TK_IN0 TK_OUT0 MLT TST TSTIO
 
 %type <itemptr> label.part symbol
-%type <ival> allreg reg evenreg ixylhreg realreg mem memxy pushable bcdesp bcdehlsp mar condition
+%type <ival> allreg reg evenreg ixylhreg realreg mem memxy pushable bcdesp bcdehl bcdehlsp mar condition
 %type <ival> spcondition
 %type <exprptr> noparenexpr parenexpr expression
 %type <ival> maybecolon maybeocto
@@ -2240,6 +2328,22 @@ statement:
 		expr_free($2);
 	}
 |
+	IF_CP_TK expression ',' expression '\n' {
+		// Unpleasant duplication of IF_TK work.
+		struct expr *compare = expr_mk($2, $1->i_value , $4);
+		expr_number_check(compare);
+		if (ifptr >= ifstmax)
+			error("Too many ifs");
+		else
+			*++ifptr = !(compare->e_value);
+
+		saveopt = fopt;
+		fopt = 1;
+		list(compare->e_value);
+		fopt = saveopt;
+		expr_free(compare);
+	}
+|
 	// IF_DEF_TK UNDECLARED '\n' might work, but probably would define the symbol
 	IF_DEF_TK arg_on ARG arg_off '\n' {
 		struct item *ip = locate(tempbuf);
@@ -2369,8 +2473,19 @@ statement:
 			strcpy(writesyms, tempbuf);
 			break;
 		case PSINC:	/* include file */
-			if (mras && !strchr(tempbuf, '.')) {
-				strcat(tempbuf, ".asm");
+			if (mras) {
+				// Allow for FILE/EXT; TRS-80 used / for extension.
+				char *slash = strchr(tempbuf, '/');
+				// Must have only one slash and short extension.
+				if (slash && !strchr(slash + 1, '/') &&
+					strlen(slash + 1) <= 3)
+				{
+					*slash = '.';
+				}
+
+				// MRAS appends "asm" suffix if not present.
+				if (!strchr(tempbuf, '.'))
+					strcat(tempbuf, ".asm");
 			}
 			next_source(tempbuf, 1);
 			break ;
@@ -2889,6 +3004,9 @@ operation:
 |
 	JP expression
 	{
+		if ($2->e_parenthesized)
+			errwarn(warn_general, "JP (addr) is equivalent to JP addr");
+
 		if (z80 || $1->i_value == 0303) {
 			checkjp(0, $2);
 			emit(1, E_CODE16, $2, 0303);
@@ -2951,6 +3069,9 @@ operation:
 	XOR expression
 		{ emit1(0306 | ($1->i_value & 070), 0, $2, ET_BYTE); }
 |
+	TST expression
+		{ emit(2, E_CODE8, $2, 0xED, 0x60 | $1->i_value); }
+|
 	LOGICAL ACC ',' expression	/* -cdk */
 		{ emit1(0306 | ($1->i_value & 070), 0, $4, ET_BYTE); }
 |
@@ -2995,6 +3116,9 @@ operation:
 |
 	XOR allreg
 		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG_DISP); }
+|
+	TST reg
+		{ emit1($1->i_value + ($2 << 3), $2, 0, ET_NOARG_DISP); }
 |
 	LOGICAL ACC ',' allreg		/* -cdk */
 		{ emit1($1->i_value + ($4 & 0377), $4, 0, ET_NOARG_DISP); }
@@ -3075,6 +3199,9 @@ operation:
 	INXDCX evenreg8
 		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG); }
 |
+	MLT bcdehl
+		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG); }
+|
 	PUSHPOP pushable
 		{ emit1($1->i_value + ($2 & 0377), $2, 0, ET_NOARG); }
 |
@@ -3141,6 +3268,9 @@ operation:
 |
 	JP '(' mar ')'
 		{ emit1(0351, $3, 0, ET_NOARG); }
+|
+	JP mar // allow JP HL|IX|IY without brackets.
+		{ emit1(0351, $2, 0, ET_NOARG); }
 |
 	CALL condition ',' expression
 		{ emit(1, E_CODE16, $4, 0304 + $2); }
@@ -3376,6 +3506,22 @@ operation:
 			}
 		}
 |
+	TK_IN0 realreg ',' parenexpr
+		{
+			if ($4->e_value < 0 || $4->e_value > 255)
+				err[vflag]++;
+			emit(2, E_CODE8, $4, $1->i_value >> 8,
+				$1->i_value | ($2 << 3));
+		}
+|
+	TK_IN0 parenexpr
+		{
+			if ($2->e_value < 0 || $2->e_value > 255)
+				err[vflag]++;
+			emit(2, E_CODE8, $2, $1->i_value >> 8,
+				$1->i_value | (6 << 3));
+		}
+|
 	TK_IN expression
 		{
 			if ($2->e_value < 0 || $2->e_value > 255)
@@ -3389,7 +3535,7 @@ operation:
 	INP realreg
 		{ emit(2, E_CODE, 0, 0355, 0100 + ($2 << 3)); }
 |
-	TK_IN 'F' ',' '(' TK_C ')'
+	TK_IN TK_F ',' '(' TK_C ')'
 		{ emit(2, E_CODE, 0, 0355, 0160); }
 |
 	TK_IN '(' TK_C ')'
@@ -3400,6 +3546,14 @@ operation:
 			if ($2->e_value < 0 || $2->e_value > 255)
 				err[vflag]++;
 			emit(1, E_CODE8, $2, $1->i_value);
+		}
+|
+	TK_OUT0 parenexpr ',' realreg
+		{
+			if ($2->e_value < 0 || $2->e_value > 255)
+				err[vflag]++;
+			emit(2, E_CODE8, $2, $1->i_value >> 8,
+				$1->i_value | ($4 << 3));
 		}
 |
 	TK_OUT expression
@@ -3424,7 +3578,15 @@ operation:
 			}
 			expr_free($6);
 
-			emit(2, E_CODE8, 0, 0355, 0101 + (6 << 3));
+			emit(2, E_CODE, 0, 0355, 0101 + (6 << 3));
+		}
+|
+	TSTIO parenexpr
+		{
+			if ($2->e_value < 0 || $2->e_value > 255)
+				err[vflag]++;
+
+			emit(2, E_CODE8, $2, $1->i_value >> 8, $1->i_value);
 		}
 |
 	IM expression
@@ -3732,7 +3894,7 @@ pushable:
 	mar
 ;
 pushable8:
-	realreg	{ if ($1 & 1) err[gflag]++; $$ = $1 << 3; }
+	realreg	{ if (($1 & 1) && $1 != 7) err[gflag]++; $$ = ($1 & 6) << 3; }
 |
 	PSW { $$ = $1->i_value; }
 ;
@@ -3749,6 +3911,17 @@ bcdesp:
 ;
 bcdehlsp:
 	bcdesp
+|
+	HL
+		{
+			$$ = $1->i_value;
+		}
+;
+bcdehl:
+	RP
+		{
+			$$ = $1->i_value;
+		}
 |
 	HL
 		{
@@ -3873,7 +4046,7 @@ expression:
 
 parenexpr:
 	'(' expression ')'
-		{	$$ = $2;	}
+		{	$$ = $2; $$->e_parenthesized = 1;	}
 ;
 
 noparenexpr:
@@ -4082,7 +4255,7 @@ noparenexpr:
 		{
 			int low;
 			expr_reloc_check($2);
-			get_tstates(memory + phaseaddr($2->e_value), &low, 0, 0);
+			get_tstates(memory + phaseaddr($2->e_value), &low, 0, 0, 0);
 			$$ = expr_num(low);
 			expr_free($2);
 		}
@@ -4091,7 +4264,7 @@ noparenexpr:
 		{
 			int high;
 			expr_reloc_check($2);
-			get_tstates(memory + phaseaddr($2->e_value), 0, &high, 0);
+			get_tstates(memory + phaseaddr($2->e_value), 0, &high, 0, 0);
 			$$ = expr_num(high);
 			expr_free($2);
 		}
@@ -4250,8 +4423,10 @@ char	numpart[] = {
 #define ZNONSTD	(32)	/* non-standard Z-80 mnemonic (probably TDL or DRI) */
 #define COL0	(64)	/* will always be recognized in logical column 0 */
 #define MRASOP	(128)	/* dig operator out of identifiers */
+#define Z180	(256)	/* used in Z180 (HD64180) instructions */
 
 struct	item	keytab[] = {
+	{"*get",	PSINC,	ARGPSEUDO,	VERB | COL0 },
 	{"*include",	PSINC,	ARGPSEUDO,	VERB | COL0 },
 	{"*list",	0,	LIST,		VERB | COL0 },
 	{"*mod",	0,	MRAS_MOD,	VERB },
@@ -4366,6 +4541,7 @@ struct	item	keytab[] = {
 	{".extern",	0,	EXTRN,		VERB },
 	{".extrn",	0,	EXTRN,		VERB },
 	{"exx",		0331,	NOOPERAND,	VERB | Z80 },
+	{"f",		0,	TK_F,		Z80 },
 	{".flist",	4,	LIST,		VERB },
 	{"ge",		0,	GE,		0 },
 	{".ge.",	0,	MROP_GE,	TERM | MRASOP },
@@ -4379,16 +4555,23 @@ struct	item	keytab[] = {
 	{".high.",	0,	MROP_HIGH,	TERM | MRASOP },
 	{"hl",		040,	HL,		Z80 },
 	{"hlt",		0166,	NOOPERAND,	VERB | I8080 },
+	{"hx",   	0x1DD04,IXYLH,		Z80 | UNDOC },
+	{"hy",   	0x1FD04,IXYLH,		Z80 | UNDOC },
 	{"i",		0,	MISCREG,	Z80 },
 	{".if",		0,	IF_TK,		VERB | COL0 },
 	{".ifdef",	1,	IF_DEF_TK,	VERB | COL0 },
+	{".ifeq",	'=',	IF_CP_TK,	VERB | COL0 },
+	{".ifgt",	'>',	IF_CP_TK,	VERB | COL0 },
+	{".iflt",	'<',	IF_CP_TK,	VERB | COL0 },
 	{".ifndef",	0,	IF_DEF_TK,	VERB | COL0 },
+	{".ifne",	NE,	IF_CP_TK,	VERB | COL0 },
 	{"im",		0166506,IM,		VERB | Z80 },
 	{"im0",		0xed46,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"im1",		0xed56,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"im2",		0xed5e,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{".import",	PSIMPORT,ARGPSEUDO,	VERB | COL0 },
 	{"in",		0333,	TK_IN,		VERB | I8080 | Z80 },
+	{"in0",		0xED00,	TK_IN0,		VERB | Z180 },
 	{"inc",		4,	INCDEC,		VERB | Z80 },
 	{".incbin", 	0, 	INCBIN,		VERB },
 	{".include",	PSINC,	ARGPSEUDO,	VERB | COL0 },	// COL0 only needed for MRAS mode
@@ -4453,15 +4636,18 @@ struct	item	keytab[] = {
 	{"lspd",	0xed7b,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"lt",		0,	LT,		0 },
 	{".lt.",	0,	MROP_LT,	TERM | MRASOP },
+	{"lx",   	0x1DD05,IXYLH,		Z80 | UNDOC },
 	{"lxi",		1,	LXI,		VERB | I8080 },
 	{"lxix",	0xdd21,	LDST16,		VERB | Z80 | ZNONSTD },
 	{"lxiy",	0xfd21,	LDST16,		VERB | Z80 | ZNONSTD },
+	{"ly",   	0x1FD05,IXYLH,		Z80 | UNDOC },
 	{"m",		070,	COND,		I8080 | Z80 },
 	{".maclib",	PSMACLIB,ARGPSEUDO,	VERB },
 	{".macro",	0,	MACRO,		VERB },
 	{".max",	1,	MINMAX,		VERB },
 	{".min",	0,	MINMAX,		VERB },
 	{".mlist",	6,	LIST,		VERB },
+	{"mlt",		0xED4C,	MLT,		VERB | Z180 },
 	{"mod",		0,	'%',		0 },
 	{".mod.",	0,	MROP_MOD,	TERM | MRASOP },
 	{"mov",		0x40,	MOV,		VERB | I8080 },
@@ -4488,9 +4674,14 @@ struct	item	keytab[] = {
 	{"ori",		0366,	ALUI8,		VERB | I8080 },
 	{"orx",		0xddb6,	ALU_XY,		VERB | Z80 | ZNONSTD },
 	{"ory",		0xfdb6,	ALU_XY,		VERB | Z80 | ZNONSTD },
+	{"otdm",	0xED8B,	NOOPERAND,	VERB | Z180 },
+	{"otdmr",	0xED9B,	NOOPERAND,	VERB | Z180 },
 	{"otdr",	0166673,NOOPERAND,	VERB | Z80 },
+	{"otim",	0xED83,	NOOPERAND,	VERB | Z180 },
+	{"otimr",	0xED93,	NOOPERAND,	VERB | Z180 },
 	{"otir",	0166663,NOOPERAND,	VERB | Z80 },
 	{"out",		0323,	TK_OUT,		VERB | I8080 | Z80 },
+	{"out0",	0xED01,	TK_OUT0,	VERB | Z180 },
 	{"outd",	0166653,NOOPERAND,	VERB | Z80 },
 	{"outdr",	0166673,NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"outi",	0166643,NOOPERAND,	VERB | Z80 },
@@ -4586,6 +4777,7 @@ struct	item	keytab[] = {
 	{"slax",	0xddcb0026,SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"slay",	0xfdcb0026,SHIFT_XY,	VERB | Z80 | ZNONSTD },
 	{"sll",		0xCB30,	SHIFT,		VERB | Z80 },
+	{"slp",		0xED76,	NOOPERAND,	VERB | Z180 },
 	{"sp",		060,	SP,		I8080 | Z80 },
 	{".space",	2,	LIST,		VERB },
 	{"sphl",	0371,	NOOPERAND,	VERB | I8080 },
@@ -4617,11 +4809,15 @@ struct	item	keytab[] = {
 	{"tihi",	0,	TIHI,		0 },
 	{"tilo",	0,	TILO,		0 },
 	{".title",	SPTITL,	SPECIAL,	VERB | COL0},
+	{"tst",		0xED04,	TST,		VERB | Z180 },
 	{".tstate",	0,	TSTATE,		VERB },
+	{"tstio",	0xED74,	TSTIO,		VERB | Z180 },
 	{"v",		050,	COND,		Z80 },
 	{".word",	0,	DEFW,		VERB },
 	{".wsym",	PSWSYM,	ARGPSEUDO,	VERB },
 	{"xchg",	0353,	NOOPERAND,	VERB | I8080 },
+	{"xh",   	0x1DD04,IXYLH,		Z80 | UNDOC },
+	{"xl",   	0x1DD05,IXYLH,		Z80 | UNDOC },
 	{"xor",		0250,	XOR,		VERB | Z80 | TERM },
 	{".xor.",	0,	MROP_XOR,	TERM | MRASOP },
 	{"xorx",	0xddae,	ALU_XY,		VERB | Z80 | ZNONSTD },
@@ -4631,7 +4827,10 @@ struct	item	keytab[] = {
 	{"xthl",	0343,	NOOPERAND,	VERB | I8080 },
 	{"xtix",	0xdde3,	NOOPERAND,	VERB | Z80 | ZNONSTD },
 	{"xtiy",	0xfde3,	NOOPERAND,	VERB | Z80 | ZNONSTD },
+	{"yh",   	0x1FD04,IXYLH,		Z80 | UNDOC },
+	{"yl",   	0x1FD05,IXYLH,		Z80 | UNDOC },
 	{"z",		010,	SPCOND,		Z80 },
+	{".z180",	2,	INSTSET,	VERB },
 	{".z80",	1,	INSTSET,	VERB },
 };
 
@@ -4857,7 +5056,9 @@ int lex()
 				c = nextchar();
 				continue;
 			}
-			*p = (c >= 'A' && c <= 'Z') ? c + 'a' - 'A' : c;
+			// GWP - don't lowercase
+			//*p = (c >= 'A' && c <= 'Z') ? c + 'a' - 'A' : c;
+			*p = c;
 			if (mras && *p == '?') {
 				char *q;
 
@@ -4906,7 +5107,7 @@ int lex()
 		}
 
 		// Special case for AF'
-		if (c == '\'' && strcmp(tempbuf, "af") == 0)
+		if (c == '\'' && ci_strcmp(tempbuf, "af") == 0)
 			return AFp;
 
 		endc = c;
@@ -4945,6 +5146,9 @@ int lex()
 			// Arguments allow mnemonics and psuedo-ops
 			exclude = VERB;
 			include = TERM;
+		}
+		else if (logcol == 0 && first_always_label) {
+			exclude = ~TERM;
 		}
 		else if (logcol <= 1 && c == ':') {
 			exclude = ~TERM;
@@ -5192,7 +5396,7 @@ int convert(char *buf, char *bufend, int *overflow)
 	if (!overflow)
 		overflow = &dummy;
 
-	if (buf[0] == '0' && buf[1] == 'x' && buf[2]) {
+	if (buf[0] == '0' && (buf[1] == 'x' || buf[1] == 'X') && buf[2]) {
 		radix = 16;
 		d0 = buf + 2;
 		dn = bufend;
@@ -5205,16 +5409,21 @@ int convert(char *buf, char *bufend, int *overflow)
 		d0 = buf;
 		dn = bufend - 1;
 		switch (*dn) {
+		case 'O':
 		case 'o':
+		case 'Q':
 		case 'q':
 			radix = 8;
 			break;
+		case 'D':
 		case 'd':
 			radix = 10;
 			break;
+		case 'H':
 		case 'h':
 			radix = 16;
 			break;
+		case 'B':
 		case 'b':
 			radix = 2;
 			break;
@@ -5232,7 +5441,10 @@ int convert(char *buf, char *bufend, int *overflow)
 
 		for (; d0 < dn; d0++) {
 			unsigned int ovchk = (unsigned int)yylval.ival;
-			int c = *d0 - (*d0 > '9' ? ('a' - 10) : '0');
+			int c = *d0;
+			if (c >= 'a') c -= 'a' - 10;
+			else if (c >= 'A') c -= 'A' - 10;
+			else c -= '0';
 			if (c < 0 || c >= radix) {
 				radix = 0;
 				break;
@@ -5276,8 +5488,12 @@ int check_keytab()
 		// Uncomment to liat all 8080 verbs to assist documentation.
 		//if ((keytab[i].i_uses & (VERB | I8080)) == (VERB | I8080))
 		//	printf("\tdb\t%s\n", keytab[i].i_string);
-		// Uncomment to liat all Z-80 verbs to assist documentation.
+		// Uncomment to list all Z-80 verbs to assist documentation.
 		//if ((keytab[i].i_uses & (VERB | Z80)) == (VERB | Z80))
+		//	printf("%-6s   $%X\n", keytab[i].i_string,
+		//		item_value(keytab + i));
+		// Uncomment to list all Z-180 verbs to assist documentation.
+		//if ((keytab[i].i_uses & (VERB | Z180)) == (VERB | Z180))
 		//	printf("%-6s   $%X\n", keytab[i].i_string,
 		//		item_value(keytab + i));
 	}
@@ -5303,7 +5519,7 @@ struct item *keyword(char *name)
 		i = (l+u)/2;
 		ip = &keytab[i];
 		key = ip->i_string;
-		r = strcmp(name + (name[0] == '.'), key + (key[0] == '.'));
+		r = ci_strcmp(name + (name[0] == '.'), key + (key[0] == '.'));
 		if (r == 0) {
 			// Do not allow ".foo" to match "foo"
 			if (name[0] == '.' && key[0] != '.')
@@ -5340,12 +5556,12 @@ struct item *item_lookup(char *name, struct item *table, int table_size)
 	/*
 	 *  hash into item table
 	 */
-	int hash = 0;
+	unsigned long hash = 0;
 	char *p = name;
 	while (*p) {
 		char ch = *p++;
 		if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
-		hash += ch;
+		hash += hash * 67 + ch - 113;
 	}
 	hash %= table_size;
 	ip = &table[hash];
@@ -5487,7 +5703,9 @@ found:
 				goto token_done;
 			}
 		}
-		if (ip->i_token == IF_TK || ip->i_token == IF_DEF_TK) {
+		if (ip->i_token == IF_TK || ip->i_token == IF_DEF_TK ||
+			ip->i_token == IF_CP_TK)
+		{
 			if (ifptr >= ifstmax)
 				error("Too many ifs");
 			else *++ifptr = 1;
@@ -5583,7 +5801,7 @@ int found_multi(int ch)
 
 	if (ch == mc_quote && (mc_quote == '"' || mc_quote == '\''))
 		mc_quote = -1;
-	else if (ch == '\'' || ch == '"' || ch == ';')
+	else if (mc_quote < 0 && (ch == '\'' || ch == '"' || ch == ';'))
 		mc_quote = ch;
 	else if (ch == '*' && mc_first)
 		mc_quote = '*';
@@ -6084,8 +6302,8 @@ void usage(char *msg, char *param)
 	fprintf(stderr, msg, param);
 	fprintf(stderr, "\n");
 	version();
-	fprintf(stderr, "usage: zmac [-8bcefghijJlLmnopstz] [-I dir] [-Pk=n] file[.z]\n");
-	fprintf(stderr, "other opts: --rel[7] --mras --zmac --dri --nmnv --dep --help --doc --version\n");
+	fprintf(stderr, "usage: zmac [-8bcefghijJlLmnopstz] [-I dir] [-Pk=n] [-Dsym] file[.z]\n");
+	fprintf(stderr, "other opts: --rel[7] --mras --zmac --dri --nmnv --z180 --fcal --dep --help --doc --version\n");
 	fprintf(stderr, "  zmac -h for more detail about options.\n");
 	exit(1);
 }
@@ -6118,14 +6336,17 @@ void help()
 	fprintf(stderr, "   -t\t\toutput error count instead of list of errors\n");
 	fprintf(stderr, "   -z\t\tuse Z-80 timings and interpretation of mnemonics\n");
 	fprintf(stderr, "   -Pk=num\tset @@k to num before assembly (e.g., -P4=10)\n");
+	fprintf(stderr, "   -Dsym\tset symbol sym to 1 before assembly (e.g., define it)\n");
 	fprintf(stderr, "   --od\tdir\tdirectory unnamed output files (default \"zout\")\n");
 	fprintf(stderr, "   --oo\thex,cmd\toutput only listed file suffix types\n");
 	fprintf(stderr, "   --xo\tlst,cas\tdo not output listed file suffix types\n");
 	fprintf(stderr, "   --nmnv\tdo not interpret mnemonics as values in expressions\n");
+	fprintf(stderr, "   --z180\tuse Z-180 timings and extended instructions\n");
 	fprintf(stderr, "   --dep\tlist files included\n");
 	fprintf(stderr, "   --mras\tlimited MRAS/EDAS compatibility\n");
 	fprintf(stderr, "   --rel\toutput .rel file only (--rel7 for 7 character symbol names)\n");
 	fprintf(stderr, "   --zmac\tcompatibility with original zmac\n");
+	fprintf(stderr, "   --fcal\tidentifier in first column is always a label\n");
 	fprintf(stderr, "   --doc\toutput documentation as HTML file\n");
 
 	exit(0);
@@ -6138,6 +6359,7 @@ int main(int argc, char *argv[])
 	int  files;
 	int used_o;
 	int used_oo;
+	char *zmac_args_env;
 #ifdef DBUG
 	extern  yydebug;
 #endif
@@ -6153,6 +6375,37 @@ int main(int argc, char *argv[])
 	// Special flag for unit testing.
 	if (argc > 1 && strcmp(argv[1], "--test") == 0)
 		exit(!check_keytab());
+
+	// To avoid typing typical command-line arguments every time we
+	// allow ZMAC_ARGS environment variable to augment the command-line.
+	zmac_args_env = getenv("ZMAC_ARGS");
+	if (zmac_args_env) {
+		int new_argc = 0;
+		char *arg;
+		char **new_argv;
+		static char *zmac_args;
+
+		// Overestimate to size of new argv vector.
+		new_argv = malloc((argc + strlen(zmac_args_env) + 1) *
+			sizeof *new_argv);
+		// Save a copy because we (1) mutate it and (2) use it in argv.
+		zmac_args = strdup(zmac_args_env);
+
+		if (!new_argv || !zmac_args)
+			error("malloc to support ZMAC_ARGS failed");
+
+		memcpy(new_argv, argv, sizeof(*new_argv) * argc);
+		new_argc = argc;
+
+		arg = strtok(zmac_args, " \t");
+		while (arg != NULL) {
+			new_argv[new_argc++] = arg;
+			arg = strtok(NULL, " \t");
+		}
+
+		argv = new_argv;
+		argc = new_argc;
+	}
 
 	for (i=1; i<argc; i++) {
 		int skip = 0;
@@ -6193,6 +6446,11 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
+		if (strcmp(argv[i], "--fcal") == 0) {
+			first_always_label = 1;
+			continue;
+		}
+
 		if (strcmp(argv[i], "--help") == 0) {
 			help();
 			continue;
@@ -6209,6 +6467,12 @@ int main(int argc, char *argv[])
 			version();
 			exit(0);
 			continue; // not reached
+		}
+
+		if (strcmp(argv[i], "--z180") == 0) {
+			/* Equivalent to .z180 */
+			default_z80 = 2;
+			continue;
 		}
 
 		if (strcmp(argv[i], "--od") == 0) {
@@ -6231,6 +6495,9 @@ int main(int argc, char *argv[])
 			continue;
 		}
 
+		if (argv[i][0] == '-' && argv[i][1] == '-')
+			usage("Unknown option: %s", argv[i]);
+
 		if (argv[i][0] == '-' && argv[i][1] == 'P' &&
 			argv[i][2] >= '0' && argv[i][2] <= '9')
 		{
@@ -6249,11 +6516,26 @@ int main(int argc, char *argv[])
 					usage("bad -Pn= parameter value", 0);
 
 				mras_param[argv[i][2] - '0'] = sign * yylval.ival;
+				mras_param_set[argv[i][2] - '0'] = 1;
 			}
-			else if (argv[i][3] == '\0')
+			else if (argv[i][3] == '\0') {
 				mras_param[argv[i][2] - '0'] = -1;
+				mras_param_set[argv[i][2] - '0'] = 1;
+			}
 			else
 				usage("-Pn syntax error", 0);
+
+			continue;
+		}
+
+		if (argv[i][0] == '-' && argv[i][1] == 'D') {
+			struct cl_symbol *sym = malloc(sizeof(struct cl_symbol));
+			if (!argv[i][2])
+				usage("missing symbol name for -D", 0);
+
+			sym->name = argv[i] + 2;
+			sym->next = cl_symbol_list;
+			cl_symbol_list = sym;
 
 			continue;
 		}
@@ -6393,8 +6675,10 @@ int main(int argc, char *argv[])
 				continue;
 
 			default:	/*  error  */
-				usage("Unknown option", 0);
-
+				{
+					char badopt[2] = { argv[i][0], 0 };
+					usage("Unknown option: %s", badopt);
+				}
 			}
 			if (skip)
 				break;
@@ -6597,6 +6881,7 @@ int main(int argc, char *argv[])
 			nextline_peek = linepeek[now_in];
 		}
 		setvars();
+		clear_instdata_flags();
 		fseek(now_file, (long)0, 0);
 
 	#ifdef DEBUG
@@ -6645,7 +6930,13 @@ int main(int argc, char *argv[])
 			if (*outf[i].fpp && outf[i].system) {
 				fclose(*outf[i].fpp);
 				*outf[i].fpp = NULL;
+				// unlink is an intended implicit declaration -- silence the gcc warning.
+				// Old gcc's don't permit #pragman in a function.
+				// Uncomment to suppress the warning.
+				//#pragma GCC diagnostic push
+				//#pragma GCC diagnostic ignored "-Wimplicit-function-declaration"
 				unlink(outf[i].filename);
+				//#pragma GCC diagnostic pop
 				if (outf[i].wanted)
 					fprintf(stderr, "Warning: %s not output -- no entry address (forgot \"end label\")\n", outf[i].filename);
 			}
@@ -6913,7 +7204,7 @@ void suffix_list(char *sfx_lst, int no_open)
 	}
 }
 
-void equate(char *id, int value)
+void equate(char *id, int value, int scope)
 {
 	struct item *it;
 
@@ -6923,11 +7214,18 @@ void equate(char *id, int value)
 		it->i_value = value;
 		it->i_token = EQUATED;
 		it->i_pass = npass;
-		it->i_scope = SCOPE_BUILTIN;
+		it->i_scope = scope;
 		it->i_uses = 0;
 		it->i_string = malloc(strlen(id)+1);
 		strcpy(it->i_string, id);
 	}
+
+	// This variable test true for ifdef
+	// This is a slightly subtle way to ensure it->i_pass == npass
+	// Setting it to npass or npass + 1 doesn't always work due to
+	// the different contexts in which setvars() is called.
+	if (scope & (SCOPE_CMD_D | SCOPE_CMD_P))
+		it->i_pass++;
 }
 
 /*
@@ -6936,6 +7234,7 @@ void equate(char *id, int value)
 void setvars()
 {
 	int  i;
+	struct cl_symbol *sym;
 
 	peekc = NOPEEK;
 	inpptr = 0;
@@ -6983,17 +7282,17 @@ void setvars()
 	// absolutely necessary for MAC compatibility.  But there's
 	// some use in having them available always.
 
-	equate("b", 0);
-	equate("c", 1);
-	equate("d", 2);
-	equate("e", 3);
-	equate("h", 4);
-	equate("l", 5);
-	equate("m", 6);
-	equate("a", 7);
+	equate("b", 0, SCOPE_BUILTIN);
+	equate("c", 1, SCOPE_BUILTIN);
+	equate("d", 2, SCOPE_BUILTIN);
+	equate("e", 3, SCOPE_BUILTIN);
+	equate("h", 4, SCOPE_BUILTIN);
+	equate("l", 5, SCOPE_BUILTIN);
+	equate("m", 6, SCOPE_BUILTIN);
+	equate("a", 7, SCOPE_BUILTIN);
 
-	equate("sp", 6);
-	equate("psw", 6);
+	equate("sp", 6, SCOPE_BUILTIN);
+	equate("psw", 6, SCOPE_BUILTIN);
 
 	// TODO - these are now handled lexically in --dri mode
 	// There are a large number of symbols to add to support
@@ -7008,8 +7307,11 @@ void setvars()
 		var[1] = '@';
 		var[2] = '0' + i;
 		var[3] = '\0';
-		equate(var, mras_param[i]);
+		equate(var, mras_param[i], mras_param_set[i] ? SCOPE_CMD_P : SCOPE_BUILTIN);
 	}
+
+	for (sym = cl_symbol_list; sym; sym = sym->next)
+		equate(sym->name, 1, SCOPE_CMD_D);
 
 	reset_import();
 }
@@ -7028,6 +7330,14 @@ void clear()
 		memflag[i] = 0;
 		tstatesum[i] = 0;
 	}
+}
+
+void clear_instdata_flags()
+{
+	int i;
+
+	for (i = 0; i < sizeof(memory) / sizeof(memory[0]); i++)
+		memflag[i] &= ~(MEM_DATA | MEM_INST);
 }
 
 void setmem(int addr, int value, int type)
@@ -7097,7 +7407,7 @@ void compactsymtab()
 void putsymtab()
 {
 	int  i, j, k, t, rows;
-	char c, c1, seg = ' ';
+	char c, seg = ' '; //, c1;
 	int numcol = printer_output ? 4 : 1;
 	struct item *tp;
 
@@ -7124,10 +7434,11 @@ void putsymtab()
 					c = '=' ;
 				if (t == COMMON)
 					c = '/';
-				if (tp->i_uses == 0)
-					c1 = '+' ;
-				else
-					c1 = ' ' ;
+
+				//if (tp->i_uses == 0)
+				//	c1 = '+' ;
+				//else
+				//	c1 = ' ' ;
 
 				// GWP - decided I don't care about uses
 				// even if it were accurate.
@@ -7145,15 +7456,25 @@ void putsymtab()
 						seg = SEGCHAR(tp->i_scope & SCOPE_SEGMASK);
 
 					if (tp->i_value >> 16)
-						fprintf(fout, "%8x%c", tp->i_value, seg);
+						fprintf(fout, "%08X%c", tp->i_value, seg);
+					else if (tp->i_value >> 8)
+						fprintf(fout, "%4X%c    ", tp->i_value, seg);
 					else
-						fprintf(fout, "%4x%c    ", tp->i_value & 0xffff, seg);
+						fprintf(fout, "%02X%c      ", tp->i_value, seg);
+
+					fprintf(fout, " %d", tp->i_value);
 
 					if (tp->i_scope & SCOPE_EXTERNAL)
 						fprintf(fout, " (extern)");
 
 					if (tp->i_scope & SCOPE_PUBLIC)
 						fprintf(fout, " (public)");
+
+					if (tp->i_scope & SCOPE_CMD_P)
+						fprintf(fout, " (command line -P)");
+
+					if (tp->i_scope & SCOPE_CMD_D)
+						fprintf(fout, " (command line -D)");
 				}
 			}
 		}
@@ -8010,6 +8331,7 @@ void incbin(char *filename)
 	int start = dollarsign;
 	int last = start;
 	int bds_count;
+	int bds_dollar = dollarsign, bds_addr = emit_addr, bds_len;
 
 	if (!fp) {
 		char ebuf[1024];
@@ -8024,11 +8346,13 @@ void incbin(char *filename)
 
 	// Avoid emit() because it has a small buffer and it'll spam the listing.
 	bds_count = 0;
+	bds_len = 0;
 	while ((ch = fgetc(fp)) != EOF) {
 		if (outpass && fbds) {
 			if (bds_count == 0)
 				fprintf(fbds, "%04x %04x d ", dollarsign, emit_addr);
 			fprintf(fbds, "%02x", ch);
+			bds_len++;
 			bds_count++;
 			if (bds_count == 16) {
 				fprintf(fbds, "\n");
@@ -8048,8 +8372,12 @@ void incbin(char *filename)
 		putrel(ch);
 		putout(ch);
 	}
-	if (outpass && fbds && bds_count)
-		fprintf(fbds, "\n");
+	if (outpass && fbds) {
+		if (bds_count)
+			fprintf(fbds, "\n");
+
+		bds_perm(bds_dollar, bds_addr, bds_len);
+	}
 
 	fclose(fp);
 
@@ -8075,14 +8403,15 @@ void incbin(char *filename)
 
 		fputs(linebuf, fout);
 
-		lineptr = linebuf;
 	}
+	lineptr = linebuf;
 }
 
 void dc(int count, int value)
 {
 	int start = dollarsign;
 	int bds_count;
+	int bds_addr = emit_addr, bds_len = count;
 
 	addtoline('\0');
 	if (outpass && fbds)
@@ -8104,6 +8433,7 @@ void dc(int count, int value)
 
 		if (segment == SEG_CODE)
 			setmem(emit_addr, value, MEM_DATA);
+
 		emit_addr++;
 		emit_addr &= 0xffff;
 		dollarsign++;
@@ -8113,8 +8443,13 @@ void dc(int count, int value)
 		putrel(value);
 		putout(value);
 	}
-	if (outpass && fbds && bds_count)
-		fprintf(fbds, "\n");
+
+	if (outpass && fbds) {
+		if (bds_count)
+			fprintf(fbds, "\n");
+
+		bds_perm(start, bds_addr, bds_len);
+	}
 
 	// Do our own list() work as we emit bytes manually.
 
@@ -8138,10 +8473,11 @@ void dc(int count, int value)
 		fputs(linebuf, fout);
 		lsterr2(1);
 
-		lineptr = linebuf;
 	}
 	else
 		lsterr1();
+
+	lineptr = linebuf;
 }
 
 #define OUTREC_SEG(rec)		outbuf[rec]
@@ -8412,6 +8748,7 @@ struct expr *expr_alloc(void)
 	ex->e_item = 0;
 	ex->e_left = 0;
 	ex->e_right = 0;
+	ex->e_parenthesized = 0;
 
 	return ex;
 }
@@ -8604,15 +8941,42 @@ void expr_free(struct expr *ex)
 
 int synth_op(struct expr *ex, int gen)
 {
-	if (ex->e_token == '&' && is_number(ex->e_right) &&
-		ex->e_right->e_value == 255)
-	{
-		if (gen) {
-			extend_link(ex->e_left);
-			putrelop(RELOP_LOW);
-			return 1;
+	if (!is_number(ex->e_right))
+		return 0;
+
+	switch (ex->e_token) {
+	case '&':
+		if (ex->e_right->e_value == 255) {
+			if (gen) {
+				extend_link(ex->e_left);
+				putrelop(RELOP_LOW);
+				return 1;
+			}
+			return can_extend_link(ex->e_left);
 		}
-		return can_extend_link(ex->e_left);
+		break;
+	case SHR:
+		if (ex->e_right->e_value <= 15) {
+			if (gen) {
+				extend_link(ex->e_left);
+				extend_link(expr_num(1 << ex->e_right->e_value));
+				putrelop(RELOP_DIV);
+			}
+			return can_extend_link(ex->e_left);
+		}
+		break;
+	case SHL:
+		if (ex->e_right->e_value <= 15) {
+			if (gen) {
+				extend_link(ex->e_left);
+				extend_link(expr_num(1 << ex->e_right->e_value));
+				putrelop(RELOP_MUL);
+			}
+			return can_extend_link(ex->e_left);
+		}
+		break;
+	default:
+		break;
 	}
 
 	return 0;
@@ -8642,8 +9006,12 @@ int can_extend_link(struct expr *ex)
 		return 1;
 
 	// If we have a value available then we're good.
-	if (!(ex->e_scope & SCOPE_NORELOC))
+	if (!(ex->e_scope & SCOPE_NORELOC)) {
+		//printf("HEY!\n");
+		//if (ex->e_item && ex->e_item->i_string)
+		//	printf("ext link says OK for '%s'\n", ex->e_item->i_string);
 		return 1;
+	}
 
 	// Might be able to synthesize the operation.
 	if (synth_op(ex, 0))
@@ -8812,7 +9180,7 @@ void write_250(int low, int high)
 		// Nothing to output.  So we'll just delete the output file.
 		int i;
 		for (i = 0; i < CNT_OUTF; i++) {
-			if (*outf[i].fpp == ftcas || *outf[i].fpp == f250wav) {
+			if (*outf[i].fpp && (*outf[i].fpp == ftcas || *outf[i].fpp == f250wav)) {
 				fclose(*outf[i].fpp);
 				*outf[i].fpp = NULL;
 				unlink(outf[i].filename);
