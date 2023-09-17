@@ -1,3 +1,5 @@
+ZMAC = zmac
+
 export CPMDrive_B = $(PWD)
 export CPMDrive_C = $(PWD)/driout
 export CPMDefault = B:
@@ -8,14 +10,14 @@ HEXS = exmpl11.hex exmpl12.hex exmpl14.hex exmpl15.hex \
 	exmpl5.hex exmpl6.hex exmpl7.hex exmpl8.hex \
 	exmpl9.hex
 
-ZMAC = $(addprefix zout/,$(HEXS) $(RELS))
+ZMACS = $(addprefix zout/,$(HEXS) $(RELS))
 DRI = $(addprefix driout/,$(HEXS) $(RELS))
 
 zout/%.hex:	%.asm
-	-zmac --dri -i -8 -c -s -n $?
+	-$(ZMAC) --dri -i -8 -c -s -n $?
 
 zout/%.rel:	%.asm
-	-zmac --dri -i -8 -c -s -n --rel $?
+	-$(ZMAC) --dri -i -8 -c -s -n --rel $?
 
 driout/%.hex:	%.asm
 	-vcpm mac $? '$$SZPCHC'
@@ -25,12 +27,18 @@ driout/%.rel:	%.asm
 
 all:
 
-zmac:	$(ZMAC)
+zmac:	$(ZMACS)
 
 dri:	driout $(DRI)
 
 driout:
 	mkdir driout
+
+report:
+	rm -rf driout zout
+	$(MAKE) dri >test-dri.out 2>&1
+	$(MAKE) zmac >test-zmac.out 2>&1
+	tar -czf report.tgz *.asm test-dri.out test-zmac.out zout/*.lst driout/*.prn
 
 clean:
 	rm -rf zout driout
