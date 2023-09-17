@@ -579,6 +579,7 @@ int	mras_param_set[10];
 
 struct cl_symbol {
 	char *name;
+	int value;
 	struct cl_symbol *next;
 } *cl_symbol_list;
 
@@ -6359,6 +6360,7 @@ int main(int argc, char *argv[])
 	int  files;
 	int used_o;
 	int used_oo;
+	char *sp;
 	char *zmac_args_env;
 #ifdef DBUG
 	extern  yydebug;
@@ -6533,6 +6535,12 @@ int main(int argc, char *argv[])
 			if (!argv[i][2])
 				usage("missing symbol name for -D", 0);
 
+			sym->value = 1;
+			sp = strchr(argv[i] + 2, '=');
+			if (sp) {
+				*sp++ = 0;
+				sym->value = strtoul(sp, NULL, 0);
+			}
 			sym->name = argv[i] + 2;
 			sym->next = cl_symbol_list;
 			cl_symbol_list = sym;
@@ -7311,7 +7319,7 @@ void setvars()
 	}
 
 	for (sym = cl_symbol_list; sym; sym = sym->next)
-		equate(sym->name, 1, SCOPE_CMD_D);
+		equate(sym->name, sym->value, SCOPE_CMD_D);
 
 	reset_import();
 }
