@@ -1040,9 +1040,11 @@ void emit(int bytes, int desc, struct expr *data, ...)
 				}
 
 				if (var) {
-					if (var->i_chain == 0) {
-						putrel(0);
-						putrel(0);
+					if ((var->i_chain >> 16) == SEG_ABS) {
+						// covers both initial NULL
+						// and ASEG cases.
+						putrel(var->i_chain);
+						putrel(var->i_chain >> 8);
 					}
 					else {
 						putrelbits(1, 1);
